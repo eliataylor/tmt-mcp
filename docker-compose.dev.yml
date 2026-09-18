@@ -1,0 +1,49 @@
+# The obsolete top-level `version:` key is intentionally absent; Compose v2 warns on it.
+#
+# Every host-specific value is a variable so the same file serves both topologies:
+#   shared   : docker compose -f docker-compose.dev.yml up
+#   isolated : docker compose -p main-app --env-file .env.main-app \
+#                -f docker-compose.dev.yml -f docker-compose.project.yml up
+# Using variables rather than override lists matters: Compose *appends* to `ports` and
+# `volumes` when merging files, so an override would publish two ports instead of one.
+
+name: ${COMPOSE_PROJECT_NAME:-tmt-mcp}
+
+networks:
+  agent-net:
+    driver: bridge
+
+services:
+  webhook-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+    restart: unless-stopped
+    # Secrets come from the env file, never from literals committed here.
+    env_file: .env
+    environment:
+      PORT: 3000
+      DB_PATH: /app/data/agent_queue.db
+      PROJECTS_CONFIG: /config/projects.json
+      TUNNEL_METRICS_URL: http://cloudflare-tunnel:2000
+    ports:
+      # Bound to loopback: only the host orchestrator polls this. Public traffic arrives
+      # through the tunnel over the internal network instead.
+      - "127.0.0.1:${HOST_PORT:-3000}:3000"
+    volumes:
+      - ./sqlite_data/${DATA_DIR:-shared}:/app/data
+      - ./config:/config:ro
+    networks:
+      - agent-net
+
+  cloudflare-tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    # --metrics exposes /quicktunnel, which the server reads at boot to log the public
+    # webhook URL. Without it you would have to grep these logs after every restart.
+    command: tunnel --no-autoupdate --metrics 0.0.0.0:2000 --url http://webhook-server:3000
+    depends_on:
+      webhook-server:
+        condition: service_healthy
+    networks:
+      - agent-net

@@ -1,0 +1,36 @@
+{
+  "action": "labeled",
+  "issue": {
+    "id": 2938471055,
+    "node_id": "I_kwDOAbcDeF6XYZab",
+    "number": 42,
+    "title": "Match score returns 0 for candidates with no uploads",
+    "state": "open",
+    "url": "https://api.github.com/repos/my-org/primary-app/issues/42",
+    "html_url": "https://github.com/my-org/primary-app/issues/42",
+    "comments_url": "https://api.github.com/repos/my-org/primary-app/issues/42/comments",
+    "comments": 3,
+    "created_at": "2026-09-16T18:04:11Z",
+    "updated_at": "2026-09-17T22:41:02Z",
+    "user": { "login": "eliataylor", "id": 4410021, "type": "User" },
+    "labels": [
+      { "id": 8812001, "name": "bug", "color": "d73a4a" },
+      { "id": 8812002, "name": "agent:assigned", "color": "0e8a16" }
+    ],
+    "assignees": [{ "login": "dev-agent", "id": 99120034, "type": "Bot" }],
+    "body": "The scorer short-circuits when a candidate has no uploads and we end up writing a literal 0 instead of skipping the row.\n\nRelevant code:\n\n- https://github.com/my-org/primary-app/blob/main/src/services/MatchScoreService.ts#L118-L146\n- `src/lib/matchScore/messageBuilder.ts:88`\n- packages/api/src/scoring/normalize.mjs\n\nStack trace from production:\n\n```\nTypeError: Cannot read properties of undefined (reading 'tags')\n    at buildProfile (src/lib/matchScore/profile.ts:212:18)\n    at scoreCandidate (src/services/MatchScoreService.ts:131:22)\n```\n\nRelated to #7 and my-org/infra-tools#215. Regression landed in a1b2c3d4e5f67890.\n\n- [x] Reproduce with a fixture candidate\n- [ ] Skip instead of writing 0\n- [ ] Backfill the affected rows"
+  },
+  "label": { "id": 8812002, "name": "agent:assigned", "color": "0e8a16" },
+  "repository": {
+    "id": 771200345,
+    "name": "primary-app",
+    "full_name": "my-org/primary-app",
+    "private": true,
+    "owner": { "login": "my-org", "id": 55120099, "type": "Organization" },
+    "html_url": "https://github.com/my-org/primary-app",
+    "clone_url": "https://github.com/my-org/primary-app.git",
+    "ssh_url": "git@github.com:my-org/primary-app.git",
+    "default_branch": "main"
+  },
+  "sender": { "login": "eliataylor", "id": 4410021, "type": "User" }
+}

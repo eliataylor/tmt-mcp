@@ -1,0 +1,45 @@
+{
+  "action": "created",
+  "issue": {
+    "id": 2938471055,
+    "node_id": "I_kwDOAbcDeF6XYZab",
+    "number": 42,
+    "title": "Match score returns 0 for candidates with no uploads",
+    "state": "open",
+    "url": "https://api.github.com/repos/my-org/primary-app/issues/42",
+    "html_url": "https://github.com/my-org/primary-app/issues/42",
+    "comments_url": "https://api.github.com/repos/my-org/primary-app/issues/42/comments",
+    "comments": 4,
+    "created_at": "2026-09-16T18:04:11Z",
+    "updated_at": "2026-09-17T23:12:40Z",
+    "user": { "login": "eliataylor", "id": 4410021, "type": "User" },
+    "labels": [
+      { "id": 8812001, "name": "bug", "color": "d73a4a" },
+      { "id": 8812002, "name": "agent:assigned", "color": "0e8a16" }
+    ],
+    "assignees": [{ "login": "dev-agent", "id": 99120034, "type": "Bot" }],
+    "body": "The scorer short-circuits when a candidate has no uploads and we end up writing a literal 0 instead of skipping the row.\n\nRelevant code:\n\n- https://github.com/my-org/primary-app/blob/main/src/services/MatchScoreService.ts#L118-L146\n- `src/lib/matchScore/messageBuilder.ts:88`\n\nRelated to #7."
+  },
+  "comment": {
+    "id": 9920114,
+    "node_id": "IC_kwDOAbcDeF5XyZ99",
+    "url": "https://api.github.com/repos/my-org/primary-app/issues/comments/9920114",
+    "html_url": "https://github.com/my-org/primary-app/issues/42#issuecomment-9920114",
+    "created_at": "2026-09-17T23:12:40Z",
+    "updated_at": "2026-09-17T23:12:40Z",
+    "user": { "login": "eliataylor", "id": 4410021, "type": "User" },
+    "body": "@dev-agent the fix also needs to cover the batch path in `scripts/backfill-unscored-match-scores.ts`, not just the live scorer.\n\nUse this shape:\n\n```ts path=src/lib/matchScore/types.ts\nexport type ScoreOutcome = { kind: 'scored'; value: number } | { kind: 'skipped'; reason: string };\n```\n\nSee https://github.com/my-org/primary-app/pull/58 for the earlier attempt."
+  },
+  "repository": {
+    "id": 771200345,
+    "name": "primary-app",
+    "full_name": "my-org/primary-app",
+    "private": true,
+    "owner": { "login": "my-org", "id": 55120099, "type": "Organization" },
+    "html_url": "https://github.com/my-org/primary-app",
+    "clone_url": "https://github.com/my-org/primary-app.git",
+    "ssh_url": "git@github.com:my-org/primary-app.git",
+    "default_branch": "main"
+  },
+  "sender": { "login": "eliataylor", "id": 4410021, "type": "User" }
+}

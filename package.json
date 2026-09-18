@@ -1,0 +1,20 @@
+{
+  "name": "tmt-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-tenant GitHub agent task queue. Ingests issue webhooks, serves leased tasks to the local orchestrator.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs",
+    "test": "node --test tests/",
+    "replay": "node scripts/replay-delivery.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "express": "^5.2.1"
+  }
+}

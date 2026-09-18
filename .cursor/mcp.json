@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${env:GITHUB_PERSONAL_ACCESS_TOKEN}"
+      }
+    },
+    "sqlite-queue": {
+      "comment": "Debugging convenience only. The server container holds this file open in WAL mode across a Docker bind mount, and WAL's shared-memory file does not cross the macOS VM boundary reliably — reads here can be stale or hit locking errors. Use GET /api/agent/tasks for anything that matters. See README.md.",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sqlite",
+        "--db-path",
+        "./sqlite_data/shared/agent_queue.db"
+      ]
+    }
+  }
+}

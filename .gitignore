@@ -1,0 +1,18 @@
+node_modules/
+
+# Secrets — never commit. Only .env.example belongs in git.
+.env
+.env.*
+!.env.example
+
+# SQLite queue data (bind-mounted into the server container)
+sqlite_data/
+*.db
+*.db-shm
+*.db-wal
+
+# Live tenant registry; only the example is tracked
+config/projects.json
+
+.DS_Store
+*.log

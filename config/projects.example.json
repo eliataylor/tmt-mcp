@@ -1,0 +1,20 @@
+{
+  "projects": [
+    {
+      "slug": "main-app",
+      "repo": "my-org/primary-app",
+      "default_branch": "main",
+      "trigger_label": "agent:assigned",
+      "mention": "@dev-agent",
+      "agent_login": "dev-agent",
+      "webhook_secret_env": "WEBHOOK_SECRET_MAIN_APP"
+    },
+    {
+      "slug": "side-project",
+      "repo": "personal/side-project",
+      "default_branch": "main",
+      "trigger_label": "agent:assigned",
+      "mention": "@dev-agent"
+    }
+  ]
+}

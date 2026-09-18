@@ -1,0 +1,21 @@
+# Isolated mode: one stack, one SQLite file, and one tunnel per project.
+#
+# Only worth doing when a project genuinely must not share a database file or a restart
+# with the others. The shared instance already handles multiple repos, and cross-project
+# concurrency happens at the agent-runner layer, not here.
+#
+# Usage:
+#   cp .env .env.main-app       # then set PROJECT_SLUG / HOST_PORT / DATA_DIR in it
+#   docker compose -p main-app --env-file .env.main-app \
+#     -f docker-compose.dev.yml -f docker-compose.project.yml up -d
+#
+# Each stack needs a distinct HOST_PORT and DATA_DIR, and brings up its own cloudflared
+# quick tunnel — so every project gets its own random hostname that changes on restart.
+
+services:
+  webhook-server:
+    environment:
+      # Pins the instance to one project. Webhooks from any other repo are rejected even
+      # if that repo is present in the same projects.json.
+      PROJECT_SLUG: ${PROJECT_SLUG:?set PROJECT_SLUG in the env file for isolated mode}
+      DB_PATH: /app/data/${PROJECT_SLUG}.db
