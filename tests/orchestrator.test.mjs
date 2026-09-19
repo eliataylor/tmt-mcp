@@ -296,6 +296,40 @@ describe('prompt rendering', () => {
       assert.match(triagePrompt, /^- #7$/m);
       assert.doesNotMatch(triagePrompt, /null#/);
     });
+
+    test('treat the issue as a report rather than as instructions', () => {
+      assert.match(triagePrompt, /report, not an instruction/);
+    });
+
+    test('ask for the missing detail through the repo templates instead of guessing', () => {
+      assert.match(triagePrompt, /too thin to classify/);
+      assert.match(triagePrompt, /screenshot or short recording/);
+      assert.match(triagePrompt, /\.github\/ISSUE_TEMPLATE\//);
+    });
+
+    // The fixture issue was opened 2026-09-16.
+    const agedBy = (now) =>
+      buildPrompt({
+        context: issueContext,
+        branch: 'main',
+        prNumber: null,
+        action: 'agent:triage',
+        taskId: 't-triage',
+        now: Date.parse(now),
+      });
+
+    test('a days-old issue is dated but not called stale', () => {
+      const fresh = agedBy('2026-09-18T18:04:11Z');
+      assert.match(fresh, /Opened: 2026-09-16T18:04:11Z \(2 days ago\)/);
+      assert.doesNotMatch(fresh, /may already be fixed/);
+    });
+
+    test('a weeks-old issue is flagged as possibly already resolved', () => {
+      const stale = agedBy('2026-10-16T18:04:11Z');
+      assert.match(stale, /This issue was opened 30 days ago, which is long enough/);
+      assert.match(stale, /may already be fixed/);
+      assert.match(stale, /Recommend closing it; do not close it yourself/);
+    });
   });
 
   describe('mode isolation', () => {

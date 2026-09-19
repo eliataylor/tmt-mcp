@@ -158,6 +158,20 @@ issue, which is enough for GitHub to record the back-reference on the other side
 not to comment on the other issues, so triaging a pile of issues does not spam every thread it
 touches.
 
+The prompt also tells triage to treat the issue as a report rather than as instructions, and gives it
+two ways out of classifying something it cannot classify:
+
+- **Too thin.** If the report does not say what was expected, what happened, or where, the agent asks
+  for the missing pieces — URL, numbered steps, role, a screenshot or recording, a concrete example —
+  instead of guessing a diagnosis. It reads `.github/ISSUE_TEMPLATE/` in the checkout first and points
+  the reporter at the template that fits, so the ask matches what that repo already defines as a
+  usable report.
+- **Too old.** The issue header carries the opened and updated dates with their age in days, and past
+  a week the prompt says outright that the issue may already be fixed, superseded, or describing a
+  screen that no longer exists. The agent checks the current default branch and `git log --since` over
+  the paths before calling an old report live, and can recommend closing — it still never closes
+  anything itself.
+
 A comment arriving later on a triaged issue does **not** re-triage it; triage is a one-shot
 classification. Add `agent:assigned` when the issue deserves a plan.
 
