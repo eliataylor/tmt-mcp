@@ -30,6 +30,33 @@ describe('issues events', () => {
     });
   });
 
+  test('the triage label enqueues triage mode', () => {
+    const payload = labeled();
+    payload.label = { name: 'agent:triage' };
+    assert.deepEqual(classify({ event: 'issues', payload, project: PROJECT }), {
+      kind: 'enqueue',
+      action: ACTIONS.TRIAGE,
+    });
+  });
+
+  test('a label the agent applied itself never enqueues', () => {
+    for (const sender of [
+      { login: 'Dev-Agent', type: 'User' },
+      { login: 'some-app[bot]', type: 'Bot' },
+    ]) {
+      for (const name of ['agent:triage', 'agent:assigned', 'agent:execute']) {
+        const payload = labeled();
+        payload.label = { name };
+        payload.sender = sender;
+        assert.equal(
+          classify({ event: 'issues', payload, project: PROJECT }).kind,
+          'ignore',
+          `${sender.login} adding ${name}`
+        );
+      }
+    }
+  });
+
   test('assignment to the agent login enqueues', () => {
     const payload = labeled();
     payload.action = 'assigned';
@@ -53,6 +80,20 @@ describe('issues events', () => {
     withoutLabel.action = 'opened';
     withoutLabel.issue.labels = [{ name: 'bug' }];
     assert.equal(classify({ event: 'issues', payload: withoutLabel, project: PROJECT }).kind, 'ignore');
+  });
+
+  test('an issue opened with only the triage label is triaged', () => {
+    const payload = labeled();
+    payload.action = 'opened';
+    payload.issue.labels = [{ name: 'bug' }, { name: 'agent:triage' }];
+    assert.equal(classify({ event: 'issues', payload, project: PROJECT }).action, ACTIONS.TRIAGE);
+  });
+
+  test('an issue opened with both triage and trigger labels gets the plan', () => {
+    const payload = labeled();
+    payload.action = 'opened';
+    payload.issue.labels = [{ name: 'agent:triage' }, { name: 'agent:assigned' }];
+    assert.equal(classify({ event: 'issues', payload, project: PROJECT }).action, ACTIONS.OPENED);
   });
 
   test('closing cancels queued work', () => {
@@ -104,6 +145,13 @@ describe('issue_comment events', () => {
     const payload = commented();
     payload.comment.body = 'thanks for the report';
     payload.issue.labels = [{ name: 'bug' }];
+    assert.equal(classify({ event: 'issue_comment', payload, project: PROJECT }).kind, 'ignore');
+  });
+
+  test('a later comment does not re-triage an already triaged issue', () => {
+    const payload = commented();
+    payload.issue.labels = [{ name: 'agent:triage' }, { name: 'bug' }];
+    payload.comment.body = 'still seeing this on 2.1';
     assert.equal(classify({ event: 'issue_comment', payload, project: PROJECT }).kind, 'ignore');
   });
 

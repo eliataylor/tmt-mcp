@@ -109,5 +109,26 @@ export function createGithubClient({ token, fetchImpl = fetch, logger = console 
     async getRepo({ owner, repo }) {
       return must(await api('GET', `/repos/${owner}/${repo}`), 'Reading repository');
     },
+
+    /**
+     * Deployments a hosting integration created for a commit. Filtering by sha rather than by ref
+     * matters on a resumed issue: the branch keeps its older deployments, and reporting one of
+     * those would describe a build that has nothing to do with what the agent just pushed.
+     */
+    async listDeployments({ owner, repo, sha, perPage = 20 }) {
+      const query = new URLSearchParams({ sha, per_page: String(perPage) });
+      const res = await api('GET', `/repos/${owner}/${repo}/deployments?${query}`);
+      const list = must(res, 'Listing deployments');
+      return Array.isArray(list) ? list : [];
+    },
+
+    async listDeploymentStatuses({ owner, repo, deploymentId, perPage = 20 }) {
+      const res = await api(
+        'GET',
+        `/repos/${owner}/${repo}/deployments/${deploymentId}/statuses?per_page=${perPage}`
+      );
+      const list = must(res, 'Listing deployment statuses');
+      return Array.isArray(list) ? list : [];
+    },
   };
 }

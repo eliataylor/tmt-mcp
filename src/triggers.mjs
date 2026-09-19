@@ -6,15 +6,17 @@
  *   { kind: 'cancel', reason }   - drop this issue's pending tasks
  *   { kind: 'ignore', reason }   - acknowledge with 200 so GitHub does not retry
  *
- * Plan vs execute:
+ * Plan vs execute vs triage:
  *   trigger_label (default agent:assigned) — context + issue comment with plan/questions; no code.
  *   execute_label (default agent:execute) — implement on the task branch.
+ *   triage_label (default agent:triage) — label the issue and cross-link related ones; no code.
  */
 
 export const ACTIONS = {
   ASSIGNED: 'agent:assigned',
   OPENED: 'agent:opened',
   EXECUTE: 'agent:execute',
+  TRIAGE: 'agent:triage',
   COMMENT: 'comment_created',
 };
 
@@ -34,15 +36,20 @@ function hasExecuteLabel(payload, project) {
   return hasLabel(payload, project.execute_label);
 }
 
+function hasTriageLabel(payload, project) {
+  return hasLabel(payload, project.triage_label);
+}
+
 function ignore(reason) {
   return { kind: 'ignore', reason };
 }
 
 /**
- * The agent's own comments must never re-trigger it.
+ * The agent's own comments and label changes must never re-trigger it.
  *
  * Plan mode's deliverable is an issue comment, and the issue still carries its trigger label when
  * that comment lands — so without this the agent answers itself until a human removes the label.
+ * Triage mode's deliverable is a set of labels, which arrive back as `issues.labeled` deliveries.
  * A GitHub App is recognised by type; a machine user needs `agent_login` to match the token the
  * orchestrator posts with. Leave `agent_login` unset only when the agent posts as a Bot.
  */
@@ -68,6 +75,12 @@ export function classify({ event, payload, project }) {
   if (event === 'issues') {
     switch (action) {
       case 'labeled': {
+        // A triage run applies labels, so its own deliveries come straight back here. Escalation
+        // has to stay a human decision: without this, one triage label could label its way into
+        // execute mode.
+        if (isAgentAuthor(payload.sender, project)) {
+          return ignore('label was applied by the agent');
+        }
         const name = payload.label?.name;
         if (name === project.execute_label) {
           return { kind: 'enqueue', action: ACTIONS.EXECUTE };
@@ -75,7 +88,10 @@ export function classify({ event, payload, project }) {
         if (name === project.trigger_label) {
           return { kind: 'enqueue', action: ACTIONS.ASSIGNED };
         }
-        return ignore(`label "${name}" is not a trigger or execute label`);
+        if (name === project.triage_label) {
+          return { kind: 'enqueue', action: ACTIONS.TRIAGE };
+        }
+        return ignore(`label "${name}" is not a trigger, execute or triage label`);
       }
 
       case 'assigned':
@@ -92,7 +108,12 @@ export function classify({ event, payload, project }) {
         if (hasTriggerLabel(payload, project)) {
           return { kind: 'enqueue', action: ACTIONS.OPENED };
         }
-        return ignore('issue does not carry a trigger or execute label');
+        // Last, because an issue opened with both wants the plan; triage is what you reach for when
+        // nobody has decided the issue is worth planning yet.
+        if (hasTriageLabel(payload, project)) {
+          return { kind: 'enqueue', action: ACTIONS.TRIAGE };
+        }
+        return ignore('issue does not carry a trigger, execute or triage label');
 
       case 'closed':
         return { kind: 'cancel', reason: 'issue closed' };
@@ -123,6 +144,8 @@ export function classify({ event, payload, project }) {
     if (hasTriggerLabel(payload, project)) {
       return { kind: 'enqueue', action: ACTIONS.COMMENT };
     }
+    // The triage label is deliberately not listed: triage is a one-shot classification, so a
+    // triaged issue should go quiet again rather than re-triaging on every later comment.
     return ignore('comment has no agent mention and the issue lacks trigger or execute labels');
   }
 

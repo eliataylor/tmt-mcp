@@ -1,5 +1,6 @@
 import { rmSync, writeFileSync } from 'node:fs';
 
+import { ACTIONS } from '../src/triggers.mjs';
 import { loadConfig } from './config.mjs';
 import { createQueueClient } from './queue-client.mjs';
 import { createStore } from './state.mjs';
@@ -7,6 +8,7 @@ import { createGithubClient } from './github.mjs';
 import { createNeonClient } from './neon.mjs';
 import { paneRunLogArgv, resolveHerdrSurface, workspaceLabelFor } from './herdr.mjs';
 import { buildPrompt } from './prompt.mjs';
+import { awaitPreviews, renderPreviewComment } from './preview.mjs';
 import {
   buildRunArgs,
   containerNameFor,
@@ -19,6 +21,7 @@ import {
   createStartCommit,
   ensureWorkdir,
   prepareClone,
+  readPushedSha,
   setCommitIdentity,
 } from './repo.mjs';
 import {
@@ -140,6 +143,11 @@ async function handleTask(ctx, task) {
   const prior = store.get(slug, issueNumber) || {};
   const containerName = containerNameFor({ slug, issueNumber, taskId: task.id });
 
+  // Triage only reads the tree and writes labels and one comment, so it skips everything that
+  // exists to support code: no task branch, no start commit, no PR, no database branch, no
+  // .env.local. An issue that later gets planned or executed still gets all of that then.
+  const triage = task.action === ACTIONS.TRIAGE;
+
   const paths = createTaskDir({
     tasksDir: config.paths.tasks,
     slug,
@@ -169,68 +177,74 @@ async function handleTask(ctx, task) {
       issueNumber,
       taskId: task.id,
       defaultBranch: project.default_branch,
+      readOnly: triage,
       logger,
     });
     clonePath = clone.clonePath;
 
-    await setCommitIdentity({
-      clonePath,
-      name: process.env.GIT_AUTHOR_NAME || 'tmt agent',
-      email: process.env.GIT_AUTHOR_EMAIL || 'agent@tmt.local',
-    });
-
     const [owner, repoName] = project.repo.split('/');
     const gh = createGithubClient({ token: config.secrets.GITHUB_TOKEN, logger });
+    let pr = null;
 
-    // An empty commit is what makes a draft PR legal: GitHub rejects a PR with no commits between
-    // base and head, so pushing a branch identical to the default branch cannot open one.
-    if (!clone.resume) {
-      await createStartCommit({ clonePath, issueNumber, branch: clone.branch, logger });
-    }
+    if (!triage) {
+      await setCommitIdentity({
+        clonePath,
+        name: process.env.GIT_AUTHOR_NAME || 'tmt agent',
+        email: process.env.GIT_AUTHOR_EMAIL || 'agent@tmt.local',
+      });
 
-    const { pr, created } = await gh.ensurePullRequest({
-      owner,
-      repo: repoName,
-      branch: clone.branch,
-      base: clone.defaultBranch,
-      title: `${context.issue.title} (#${issueNumber})`,
-      body:
-        `Automated work for #${issueNumber}.\n\n` +
-        `Branch \`${clone.branch}\`, driven by the local agent orchestrator.\n` +
-        'Closing this PR also releases the ephemeral database branch.',
-    });
-    prNumber = pr.number;
-    store.merge(slug, issueNumber, { pr_number: prNumber, pr_url: pr.html_url });
+      // An empty commit is what makes a draft PR legal: GitHub rejects a PR with no commits between
+      // base and head, so pushing a branch identical to the default branch cannot open one.
+      if (!clone.resume) {
+        await createStartCommit({ clonePath, issueNumber, branch: clone.branch, logger });
+      }
 
-    if (created) {
-      await gh.commentOnIssue({
+      const ensured = await gh.ensurePullRequest({
         owner,
         repo: repoName,
-        issueNumber,
+        branch: clone.branch,
+        base: clone.defaultBranch,
+        title: `${context.issue.title} (#${issueNumber})`,
         body:
-          `Picked this up locally. Working on \`${clone.branch}\`, tracking in #${prNumber}.\n\n` +
-          'I will comment again with my understanding before making changes.',
+          `Automated work for #${issueNumber}.\n\n` +
+          `Branch \`${clone.branch}\`, driven by the local agent orchestrator.\n` +
+          'Closing this PR also releases the ephemeral database branch.',
+      });
+      pr = ensured.pr;
+      prNumber = pr.number;
+      store.merge(slug, issueNumber, { pr_number: prNumber, pr_url: pr.html_url });
+
+      if (ensured.created) {
+        await gh.commentOnIssue({
+          owner,
+          repo: repoName,
+          issueNumber,
+          body:
+            `Picked this up locally. Working on \`${clone.branch}\`, tracking in #${prNumber}.\n\n` +
+            'I will comment again with my understanding before making changes.',
+        });
+      }
+
+      if (project.neon) {
+        const neon = createNeonClient({ apiKey: config.secrets.NEON_API_KEY, logger });
+        neonInfo = await neon.ensureBranch({
+          projectId: project.neon.project_id,
+          parentBranch: project.neon.parent_branch,
+          issueNumber,
+          initSource: project.neon.init_source,
+        });
+        neonCreatedHere = neonInfo.created;
+        store.merge(slug, issueNumber, { neon_branch_id: neonInfo.branchId });
+      }
+
+      // Refuses unless git already ignores .env.local, so the agent cannot commit a live database
+      // URL.
+      await writeEnvLocal({
+        clonePath,
+        template: project.env_template,
+        values: issueEnvValues({ context, branch: clone.branch, prNumber, neonInfo }),
       });
     }
-
-    if (project.neon) {
-      const neon = createNeonClient({ apiKey: config.secrets.NEON_API_KEY, logger });
-      neonInfo = await neon.ensureBranch({
-        projectId: project.neon.project_id,
-        parentBranch: project.neon.parent_branch,
-        issueNumber,
-        initSource: project.neon.init_source,
-      });
-      neonCreatedHere = neonInfo.created;
-      store.merge(slug, issueNumber, { neon_branch_id: neonInfo.branchId });
-    }
-
-    // Refuses unless git already ignores .env.local, so the agent cannot commit a live database URL.
-    await writeEnvLocal({
-      clonePath,
-      template: project.env_template,
-      values: issueEnvValues({ context, branch: clone.branch, prNumber, neonInfo }),
-    });
 
     writePrompt(
       paths,
@@ -238,7 +252,7 @@ async function handleTask(ctx, task) {
         context,
         branch: clone.branch,
         prNumber,
-        prUrl: pr.html_url,
+        prUrl: pr?.html_url || null,
         action: task.action,
         taskId: task.id,
       })
@@ -313,6 +327,17 @@ async function handleTask(ctx, task) {
     });
 
     if (succeeded) {
+      // Before completing, so the lease and its heartbeat still cover the wait on the build.
+      await commentPreviewUrl(ctx, {
+        gh,
+        owner,
+        repo: repoName,
+        issueNumber,
+        branch: clone.branch,
+        clonePath,
+        action: task.action,
+        label,
+      });
       await queue.complete(task.id);
       logger.log(`[Task] ${label} completed`);
     } else {
@@ -349,6 +374,49 @@ async function handleTask(ctx, task) {
       taskDir: paths.dir,
       succeeded,
     });
+  }
+}
+
+/**
+ * Comment the preview URL for whatever the agent just pushed.
+ *
+ * Execute tasks only: a plan task pushes nothing, so the only deployment on the branch would be the
+ * one from the empty start commit, which shows a preview of the base branch and tells nobody
+ * anything. Silent when the repo has no hosting integration reporting deployments to GitHub.
+ */
+async function commentPreviewUrl(ctx, { gh, owner, repo, issueNumber, branch, clonePath, action, label }) {
+  const { preview } = ctx.config;
+  if (!preview.enabled || action !== ACTIONS.EXECUTE) return;
+
+  try {
+    const sha = await readPushedSha({ clonePath, branch });
+    if (!sha) {
+      logger.warn(`[Task] ${label} could not read the pushed commit; skipping the preview comment`);
+      return;
+    }
+
+    const previews = await awaitPreviews({
+      gh,
+      owner,
+      repo,
+      sha,
+      graceMs: preview.graceMs,
+      timeoutMs: preview.timeoutMs,
+      intervalMs: preview.intervalMs,
+    });
+
+    const body = renderPreviewComment({ previews, branch, sha });
+    if (!body) {
+      logger.log(`[Task] ${label} no deployment reported for ${sha.slice(0, 7)}`);
+      return;
+    }
+
+    await gh.commentOnIssue({ owner, repo, issueNumber, body });
+    logger.log(`[Task] ${label} commented ${previews.length} preview URL(s)`);
+  } catch (err) {
+    // The work is already pushed and the task already succeeded. A hosting integration being slow,
+    // absent, or rate-limited is not a reason to report that back as a failed task.
+    logger.warn(`[Task] ${label} could not comment the preview URL: ${err.message}`);
   }
 }
 

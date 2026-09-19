@@ -51,6 +51,7 @@ export function buildContext({ event, action, payload, project, deliveryId = nul
       default_branch: project.default_branch,
       trigger_label: project.trigger_label,
       execute_label: project.execute_label,
+      triage_label: project.triage_label,
       mention: project.mention,
     },
 

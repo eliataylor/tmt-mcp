@@ -4,6 +4,7 @@ export const DEFAULTS = {
   default_branch: 'main',
   trigger_label: 'agent:assigned',
   execute_label: 'agent:execute',
+  triage_label: 'agent:triage',
   mention: '@dev-agent',
 };
 
@@ -34,6 +35,7 @@ function normalizeProject(raw, index) {
     default_branch: raw.default_branch || DEFAULTS.default_branch,
     trigger_label: raw.trigger_label || DEFAULTS.trigger_label,
     execute_label: raw.execute_label || DEFAULTS.execute_label,
+    triage_label: raw.triage_label || DEFAULTS.triage_label,
     mention: raw.mention || DEFAULTS.mention,
     agent_login: raw.agent_login || null,
     webhook_secret_env: raw.webhook_secret_env || null,

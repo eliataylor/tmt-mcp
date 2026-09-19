@@ -11,7 +11,7 @@
 import { readFileSync } from 'node:fs';
 
 import { buildContext } from '../src/context.mjs';
-import { classify } from '../src/triggers.mjs';
+import { ACTIONS, classify } from '../src/triggers.mjs';
 import { loadRegistry } from '../src/projects.mjs';
 import { branchNameFor, clonePathFor, mirrorPathFor, resolveBranchPlan } from '../orchestrator/repo.mjs';
 import { buildCreateBranchBody, branchNameFor as neonBranchNameFor } from '../orchestrator/neon.mjs';
@@ -114,6 +114,9 @@ for (const file of context.references.files.slice(0, 8)) {
 }
 console.log(`thread        : ${context.fetch.comment_count} comment(s), ${context.fetch.comments_included} embedded`);
 
+// Triage reads the tree and writes labels, so every code-bearing stage below is skipped for it.
+const triage = verdict.action === ACTIONS.TRIAGE;
+
 heading('3. Git isolation');
 const mirror = mirrorPathFor(config.paths.mirrors, slug);
 const clonePath = clonePathFor(config.paths.clones, slug, issueNumber, taskId);
@@ -132,12 +135,19 @@ console.log(`  git -C ${mirror} remote update --prune`);
 console.log(`clone         : ${clonePath}`);
 console.log(`  git clone --local ${mirror} ${clonePath}`);
 console.log(`  git -C ${clonePath} remote set-url origin ${pushUrl}   (HTTPS + PAT in runner)`);
-console.log(`branch        : ${plan.branch} ${plan.resume ? '(resuming)' : '(new)'}`);
-console.log(`  git -C ${clonePath} switch --create ${plan.branch} ${plan.startPoint}`);
+if (triage) {
+  console.log(`branch        : ${project.default_branch} (read-only clone; triage creates no branch)`);
+} else {
+  console.log(`branch        : ${plan.branch} ${plan.resume ? '(resuming)' : '(new)'}`);
+  console.log(`  git -C ${clonePath} switch --create ${plan.branch} ${plan.startPoint}`);
+}
 
 heading('4. GitHub');
 const [owner, repoName] = project.repo.split('/');
-if (!plan.resume) {
+if (triage) {
+  console.log('No start commit, no branch push, and no pull request for a triage task.');
+  console.log(`The runner labels issue #${issueNumber} and comments on it over the GitHub MCP server.`);
+} else if (!plan.resume) {
   console.log(`  git commit --allow-empty -m "chore(#${issueNumber}): start agent work"`);
   console.log(`  git push --set-upstream origin ${plan.branch}`);
   console.log(`  POST /repos/${owner}/${repoName}/pulls  { head: "${plan.branch}", base: "${project.default_branch}", draft: true }`);
@@ -148,7 +158,9 @@ if (!plan.resume) {
 }
 
 heading('5. Neon');
-if (!project.neon) {
+if (triage) {
+  console.log('No database branch for a triage task; it never runs migrations or the app.');
+} else if (!project.neon) {
   console.log(`No "neon" block for ${slug} in config/orchestrator.json; no database branch.`);
 } else {
   const body = buildCreateBranchBody({
@@ -169,7 +181,11 @@ console.log('  task.json      the full context manifest');
 console.log('  prompt.md      rendered below');
 console.log('  out/           result.json and run.log come back here');
 console.log('  secrets.env    0600, GITHUB_TOKEN + CURSOR_API_KEY only');
-console.log(`\n  git -C ${clonePath} check-ignore -q .env.local   <- must exit 0 before .env.local is written`);
+console.log(
+  triage
+    ? '\n  no .env.local: a triage task gets no database URL because it runs nothing'
+    : `\n  git -C ${clonePath} check-ignore -q .env.local   <- must exit 0 before .env.local is written`
+);
 
 heading('7. Runner');
 const containerName = containerNameFor({ slug, issueNumber, taskId });
@@ -217,14 +233,20 @@ console.log('POST /api/agent/tasks/<id>/fail      otherwise, with the log tail')
 console.log(`heartbeat every ${config.task.heartbeatSeconds}s; a 409 means the task was cancelled -> docker stop`);
 console.log(`timeout after ${config.task.timeoutMs}ms -> docker stop (SIGTERM trap writes result.json)`);
 console.log(`secrets.env is shredded on every exit path; KEEP_ARTIFACTS=${config.task.keepArtifacts}`);
+if (config.preview.enabled && verdict.action === ACTIONS.EXECUTE) {
+  console.log(
+    `on success, GET /repos/${project.repo}/deployments?sha=<pushed head> then its statuses, ` +
+      `for up to ${config.preview.timeoutMs}ms -> comment the preview URL on issue #${issueNumber}`
+  );
+}
 
 heading('10. prompt.md');
 console.log(
   buildPrompt({
     context,
-    branch: plan.branch,
-    prNumber: args.resume ? 101 : null,
-    prUrl: args.resume ? `https://github.com/${project.repo}/pull/101` : null,
+    branch: triage ? project.default_branch : plan.branch,
+    prNumber: args.resume && !triage ? 101 : null,
+    prUrl: args.resume && !triage ? `https://github.com/${project.repo}/pull/101` : null,
     action: verdict.action,
     taskId,
   })

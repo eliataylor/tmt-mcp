@@ -17,6 +17,7 @@ export const PROJECT = {
   default_branch: 'main',
   trigger_label: 'agent:assigned',
   execute_label: 'agent:execute',
+  triage_label: 'agent:triage',
   mention: '@dev-agent',
   agent_login: 'dev-agent',
   webhook_secret_env: null,

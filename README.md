@@ -81,11 +81,14 @@ name instead.
 
 | Event | Condition | Result |
 | --- | --- | --- |
+| `issues.labeled` | applied by the agent itself | ignored — triage applies labels, and they must not re-trigger it |
 | `issues.labeled` | label matches `trigger_label` | queue `agent:assigned` (**plan** — issue comment only) |
 | `issues.labeled` | label matches `execute_label` (default `agent:execute`) | queue `agent:execute` (**implement** on the task branch) |
+| `issues.labeled` | label matches `triage_label` (default `agent:triage`) | queue `agent:triage` (**triage** — labels + cross-links, no code) |
 | `issues.assigned` | assignee matches `agent_login` | queue `agent:assigned` (plan) |
 | `issues.opened` / `reopened` | issue carries `execute_label` | queue `agent:execute` |
 | `issues.opened` / `reopened` | issue carries `trigger_label` (and not execute) | queue `agent:opened` (plan) |
+| `issues.opened` / `reopened` | issue carries `triage_label` only | queue `agent:triage` |
 | `issue_comment.created` | author is a `Bot`, or matches `agent_login` | ignored — the agent must not answer itself |
 | `issue_comment.created` | body contains `mention` | queue `comment_created` (plan) or `agent:execute` if `execute_label` is on the issue |
 | `issue_comment.created` | issue carries `execute_label` | queue `agent:execute` |
@@ -99,12 +102,64 @@ It only holds if `GITHUB_TOKEN` belongs to the agent and not to a human: with a 
 token the agent posts under your login, and setting `agent_login` to that login would silence
 your own comments too. Give the agent its own machine user or GitHub App before relying on it.
 
-Optional per-project override: `execute_label` in `projects.json` (default `agent:execute`).
-Removing `execute_label` does **not** cancel queued work; only losing `trigger_label` or closing the issue does.
+Optional per-project overrides in `projects.json`: `execute_label` (default `agent:execute`) and
+`triage_label` (default `agent:triage`).
+Removing `execute_label` or `triage_label` does **not** cancel queued work; only losing
+`trigger_label` or closing the issue does.
 
 **Typical flow:** add `agent:assigned` → agent posts plan/questions on the issue → human adds `agent:execute` → agent implements.
 
 Everything else gets a 200 with `{ "ignored": true }` so GitHub does not keep retrying.
+
+### The three modes
+
+| Mode | Queue action | Deliverable | Writes |
+| --- | --- | --- | --- |
+| **Triage** | `agent:triage` | Labels on the issue, plus one comment cross-linking related issues | Labels + 1 comment |
+| **Plan** | `agent:assigned`, `agent:opened`, `comment_created` | One issue comment: understanding, open questions, implementation plan | 1 comment |
+| **Execute** | `agent:execute` | The change itself, on `agent/issue-<n>`, summarized on the PR | Commits, push, PR comment |
+
+Each mode's ground rules and definition of done are rendered into the task prompt by
+[`orchestrator/prompt.mjs`](orchestrator/prompt.mjs), with this project's configured label names
+substituted in, and **only for the mode that is running** — a triage prompt does not carry the
+execute rules. [`.cursor/rules/agent-instructions.md`](.cursor/rules/agent-instructions.md) holds
+only the part that is identical for every mode (MCP usage, context gathering, the untrusted-input
+rule) and is inlined verbatim into all of them.
+
+### Triage mode
+
+`agent:triage` is the cheapest thing the agent can do to an issue: it reads the thread and the code,
+applies labels, and posts one comment cross-linking the issues this one relates to. It never opens a
+branch, a pull request, or a database branch, so the whole task is a clone, a container, and two API
+writes.
+
+The orchestrator skips every code-bearing stage for it — no start commit, no PR, no Neon branch, no
+`.env.local`, no preview comment — and the clone stays on the default branch rather than
+`agent/issue-<n>`, since checking out a previous task's unmerged work would misrepresent the current
+state of the code.
+
+Three constraints make it safe to leave on a busy repo:
+
+- **It cannot push.** The read-only clone keeps its HTTPS fetch URL, so tooling can still tell which
+  repository it is, but `remote.origin.pushurl` is set to `read-only://triage-tasks-do-not-push` —
+  a scheme git has no transport for, so a push aborts locally instead of reaching GitHub. "Do not
+  push" is enforced by git, not only by the prompt.
+
+- **The agent labels from the existing vocabulary.** It lists the repo's labels over MCP and applies
+  only names that come back; anything missing is proposed in the comment instead of created.
+- **It cannot escalate itself.** The prompt forbids the `agent:*` control labels, and
+  `issues.labeled` deliveries whose sender is the agent are ignored outright — so even a
+  misbehaving run cannot label its way from triage into execute mode.
+
+Related issues are found by shared files (paths cited in the thread, plus `git log` over those paths
+to reach the PRs and issues that touched them) and by shared function (same route, table, dependency,
+or user-facing flow). They are cross-linked by writing `#<number>` in the one comment on the triaged
+issue, which is enough for GitHub to record the back-reference on the other side — the agent is told
+not to comment on the other issues, so triaging a pile of issues does not spam every thread it
+touches.
+
+A comment arriving later on a triaged issue does **not** re-triage it; triage is a one-shot
+classification. Add `agent:assigned` when the issue deserves a plan.
 
 ## Task context
 
@@ -299,6 +354,36 @@ overlapping ticks, and it polls only while under `MAX_CONCURRENT_TASKS`. Per tas
 6. **Relay.** `result.json` from `/out` decides `complete` or `fail`; a heartbeat every
    `HEARTBEAT_INTERVAL_SECONDS` keeps the lease and doubles as the cancellation channel — a task
    moved to `canceled` (by closing the issue or removing the label) stops the container.
+7. **Preview.** On a successful execute task, the deployment URL for the commit that was just
+   pushed, commented on the issue.
+
+A triage task runs 1, 5, and 6 only: it clones read-only on the default branch and skips the branch,
+PR, Neon, `.env.local`, and preview stages entirely.
+
+### Preview deployment comments
+
+Vercel's Git integration reports deployments through GitHub's Deployments API and puts the preview
+URL in each status's `environment_url`, so the orchestrator reads it from GitHub with the token it
+already has — no Vercel API key, no project ids in `config/orchestrator.json`, and no guessing at
+how `agent/issue-42` becomes a hostname. Anything else that reports deployments to GitHub the same
+way is picked up for free.
+
+Deployments are looked up by the pushed commit rather than by the branch, because a resumed issue
+keeps its earlier deployments and reporting one of those would describe the wrong build. The wait
+is bounded twice: `PREVIEW_GRACE_MS` for a deployment record to appear at all — a repo with no
+hosting attached is dropped there instead of holding its lease — then `PREVIEW_TIMEOUT_MS` for the
+build to reach a final state. A build still running at that point is still commented, with its
+state, since the branch URL is stable and will serve the build once it lands. A failed build is
+commented too, with a link to its log. Nothing found means no comment. Set
+`PREVIEW_COMMENTS=false` to turn the whole thing off.
+
+This lands on the **issue**, not the PR, because Vercel's own bot already comments on the PR and
+the issue thread is where the agent's other updates are. Only execute tasks get one; a plan task
+pushes nothing, so the only deployment would be the empty start commit's.
+
+Previews are public by default, but a project using Deployment Protection (Vercel Authentication,
+Password Protection, Trusted IPs) will ask for a login when the link is opened. That is a Vercel
+project setting, not something this orchestrator can influence.
 
 Secrets reach the runner as a single 0600 `secrets.env` bind-mounted at `/run/secrets/env`, never
 as `-e` flags: `docker inspect` and `ps` both expose environment variables to any process on the

@@ -29,6 +29,13 @@ import {
   shredSecrets,
   writeSecrets,
 } from '../orchestrator/taskdir.mjs';
+import {
+  awaitPreviews,
+  isSettled,
+  renderPreviewComment,
+  safeHttpUrl,
+  selectPreviewStatus,
+} from '../orchestrator/preview.mjs';
 import { paneRunLogArgv, sanitizeTitle, workspaceLabelFor } from '../orchestrator/herdr.mjs';
 import { createStore } from '../orchestrator/state.mjs';
 import { shellJoin, shellQuote } from '../orchestrator/exec.mjs';
@@ -252,6 +259,91 @@ describe('prompt rendering', () => {
     assert.match(prompt, /\*\*Plan\*\*/);
   });
 
+  describe('triage tasks', () => {
+    const triagePrompt = buildPrompt({
+      context: issueContext,
+      branch: 'main',
+      prNumber: null,
+      action: 'agent:triage',
+      taskId: 't-triage',
+    });
+
+    test('announce triage mode and no branch work', () => {
+      assert.match(triagePrompt, /\*\*Triage\*\*/);
+      assert.match(triagePrompt, /Ground rules \(triage\)/);
+      assert.match(triagePrompt, /No code changes/);
+      assert.match(triagePrompt, /triage does not open one/);
+      assert.doesNotMatch(triagePrompt, /Ground rules \(plan\)/);
+      assert.doesNotMatch(triagePrompt, /Ground rules \(execute\)/);
+    });
+
+    test('forbid the control labels that would escalate the issue', () => {
+      assert.match(triagePrompt, /agent:assigned`, `agent:execute`, `agent:triage/);
+      assert.match(triagePrompt, /A human decides when the agent plans or implements/);
+    });
+
+    test('cross-link by mention rather than by commenting on other issues', () => {
+      assert.match(triagePrompt, /do not comment on those issues/);
+      assert.match(triagePrompt, /git log --oneline -- <path>/);
+      assert.match(triagePrompt, /search_issues/);
+    });
+
+    test('keep labels on the triaged issue only', () => {
+      assert.match(triagePrompt, /Label issue #42 only/);
+    });
+
+    test('a bare issue reference keeps its number instead of rendering a null repo', () => {
+      assert.match(triagePrompt, /^- #7$/m);
+      assert.doesNotMatch(triagePrompt, /null#/);
+    });
+  });
+
+  describe('mode isolation', () => {
+    const forMode = (action) =>
+      buildPrompt({
+        context: issueContext,
+        branch: action === 'agent:triage' ? 'main' : 'agent/issue-42',
+        prNumber: action === 'agent:triage' ? null : 101,
+        action,
+        taskId: `t-${action}`,
+      });
+
+    // The inlined protocol used to carry all three modes' rules, so a triage prompt told the agent
+    // to push to a branch it has no branch for and stated the triage rules twice.
+    test('a prompt carries the rules for its own mode only', () => {
+      const otherModes = {
+        'agent:triage': [/Ground rules \(plan\)/, /Ground rules \(execute\)/, /push to `origin/],
+        'agent:assigned': [/Ground rules \(triage\)/, /Ground rules \(execute\)/, /push to `origin/],
+        'agent:execute': [/Ground rules \(triage\)/, /Ground rules \(plan\)/, /Finding the related issues/],
+      };
+
+      for (const [action, forbidden] of Object.entries(otherModes)) {
+        const prompt = forMode(action);
+        for (const pattern of forbidden) {
+          assert.doesNotMatch(prompt, pattern, `${action} prompt should not mention ${pattern}`);
+        }
+      }
+    });
+
+    test('the inlined protocol stays mode-independent', () => {
+      for (const action of ['agent:triage', 'agent:assigned', 'agent:execute']) {
+        const protocol = forMode(action).split('## The issue')[0];
+        assert.match(protocol, /Shared context gathering/);
+        assert.doesNotMatch(protocol, /^## (Triage|Plan|Execute) mode/m);
+      }
+    });
+
+    test('each mode still states a deliverable and a definition of done', () => {
+      for (const [action, done] of [
+        ['agent:triage', /Definition of done \(triage\)/],
+        ['agent:assigned', /Definition of done \(plan\)/],
+        ['agent:execute', /Definition of done \(execute\)/],
+      ]) {
+        assert.match(forMode(action), done);
+      }
+    });
+  });
+
   test('points at the unfetched remainder of the thread rather than faking it', () => {
     assert.match(prompt, /only the triggering one is/);
     assert.match(prompt, /get_issue_comments/);
@@ -270,6 +362,149 @@ describe('prompt rendering', () => {
     });
     assert.match(commentPrompt, /Triggering comment/);
     assert.match(commentPrompt, /<<<TRIGGER_COMMENT/);
+  });
+});
+
+describe('preview deployment reporting', () => {
+  const status = (state, extra = {}) => ({
+    state,
+    created_at: extra.at || '2026-09-18T00:00:00Z',
+    environment_url: extra.url ?? null,
+    log_url: extra.logUrl ?? null,
+  });
+
+  /** Serves one page of deployments per poll, repeating the last page forever. */
+  function ghStub(pages) {
+    let polls = 0;
+    let page = pages[0];
+    const shas = [];
+    return {
+      shas,
+      get polls() {
+        return polls;
+      },
+      async listDeployments({ sha }) {
+        shas.push(sha);
+        page = pages[Math.min(polls, pages.length - 1)];
+        polls += 1;
+        return page.map(({ id, environment }) => ({ id, environment }));
+      },
+      async listDeploymentStatuses({ deploymentId }) {
+        return page.find((d) => d.id === deploymentId)?.statuses || [];
+      },
+    };
+  }
+
+  function fakeClock() {
+    let t = 0;
+    return {
+      now: () => t,
+      sleep: async (ms) => {
+        t += ms;
+      },
+    };
+  }
+
+  const waits = { graceMs: 45000, timeoutMs: 180000, intervalMs: 5000 };
+
+  test('state comes from the newest status but the URL from the newest one that has one', () => {
+    const picked = selectPreviewStatus([
+      status('failure', { at: '2026-09-18T00:02:00Z', logUrl: 'https://vercel.com/logs/1' }),
+      status('in_progress', { at: '2026-09-18T00:01:00Z', url: 'https://app-git-x.vercel.app' }),
+    ]);
+    assert.equal(picked.state, 'failure');
+    assert.equal(picked.url, 'https://app-git-x.vercel.app/');
+    assert.equal(picked.logUrl, 'https://vercel.com/logs/1');
+  });
+
+  test('a non-http environment_url never becomes a link', () => {
+    assert.equal(safeHttpUrl('javascript:alert(1)'), null);
+    assert.equal(safeHttpUrl('not a url'), null);
+    assert.equal(selectPreviewStatus([status('success', { url: 'javascript:alert(1)' })]).url, null);
+  });
+
+  test('only a finished build counts as settled', () => {
+    for (const state of ['pending', 'queued', 'in_progress']) assert.equal(isSettled(state), false);
+    for (const state of ['success', 'failure', 'error']) assert.equal(isSettled(state), true);
+    assert.equal(isSettled(null), false);
+  });
+
+  test('a repo with no deployments gives up after the grace window, not the full timeout', async () => {
+    const clock = fakeClock();
+    const gh = ghStub([[]]);
+    const previews = await awaitPreviews({ gh, owner: 'o', repo: 'r', sha: 'abc', ...waits, ...clock });
+
+    assert.deepEqual(previews, []);
+    assert.ok(clock.now() < waits.timeoutMs, 'should not have waited out the build timeout');
+  });
+
+  test('polls until the build settles', async () => {
+    const clock = fakeClock();
+    const gh = ghStub([
+      [{ id: 1, environment: 'Preview – app', statuses: [status('in_progress')] }],
+      [
+        {
+          id: 1,
+          environment: 'Preview – app',
+          statuses: [status('success', { at: '2026-09-18T00:03:00Z', url: 'https://app-git-x.vercel.app' })],
+        },
+      ],
+    ]);
+
+    const previews = await awaitPreviews({ gh, owner: 'o', repo: 'r', sha: 'abc', ...waits, ...clock });
+    assert.equal(gh.polls, 2);
+    assert.deepEqual(previews.map((p) => [p.state, p.url]), [
+      ['success', 'https://app-git-x.vercel.app/'],
+    ]);
+  });
+
+  test('a build that never finishes still reports the URL it has', async () => {
+    const clock = fakeClock();
+    const gh = ghStub([
+      [{ id: 1, environment: 'Preview', statuses: [status('in_progress', { url: 'https://x.vercel.app' })] }],
+    ]);
+
+    const previews = await awaitPreviews({ gh, owner: 'o', repo: 'r', sha: 'abc', ...waits, ...clock });
+    assert.equal(previews[0].state, 'in_progress');
+    assert.equal(clock.now() >= waits.timeoutMs, true);
+  });
+
+  test('deployments are looked up by the pushed commit, not the branch', async () => {
+    const gh = ghStub([[]]);
+    await awaitPreviews({ gh, owner: 'o', repo: 'r', sha: 'deadbeef', ...waits, ...fakeClock() });
+    assert.deepEqual([...new Set(gh.shas)], ['deadbeef']);
+  });
+
+  test('the comment links the branch URL and names the build state', () => {
+    const body = renderPreviewComment({
+      previews: [
+        { environment: 'Preview – app', state: 'success', url: 'https://app-git-x.vercel.app', logUrl: null },
+      ],
+      branch: 'agent/issue-42',
+      sha: 'abcdef1234567890',
+    });
+    assert.match(body, /agent\/issue-42/);
+    assert.match(body, /abcdef1/);
+    assert.match(body, /ready: https:\/\/app-git-x\.vercel\.app/);
+  });
+
+  test('a failed build is still worth a comment, with its log', () => {
+    const body = renderPreviewComment({
+      previews: [
+        { environment: 'Preview', state: 'failure', url: null, logUrl: 'https://vercel.com/logs/1' },
+      ],
+      branch: 'agent/issue-42',
+    });
+    assert.match(body, /failed/);
+    assert.match(body, /\[build log\]\(https:\/\/vercel\.com\/logs\/1\)/);
+  });
+
+  test('nothing found means no comment at all', () => {
+    assert.equal(renderPreviewComment({ previews: [], branch: 'agent/issue-42' }), null);
+    assert.equal(
+      renderPreviewComment({ previews: [{ environment: 'Preview', state: null, url: null }], branch: 'b' }),
+      null
+    );
   });
 });
 

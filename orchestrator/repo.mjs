@@ -14,6 +14,9 @@ import { git, run } from './exec.mjs';
  * repository, which lands outside the bind mount, so every git command inside the container fails.
  */
 
+/** No git transport by this name, so `git push` in a read-only clone fails instead of reaching GitHub. */
+export const READ_ONLY_PUSH_URL = 'read-only://triage-tasks-do-not-push';
+
 export function branchNameFor(issueNumber) {
   // Keeps `issue-<n>` so the Neon cleanup workflow's `issue-\K\d+` regex still matches.
   return `agent/issue-${issueNumber}`;
@@ -122,6 +125,7 @@ export async function prepareClone({
   taskId,
   defaultBranch,
   noHardlinks = false,
+  readOnly = false,
   logger = console,
 }) {
   const mirror = await ensureMirror({ mirrorsDir, slug, fetchUrl, localPath, logger });
@@ -162,6 +166,26 @@ export async function prepareClone({
   // HTTPS origin with no token in the URL. The runner's entrypoint installs a credential helper
   // that reads GITHUB_TOKEN from the environment (SSH is not available inside the container).
   await g.run(['remote', 'set-url', 'origin', pushUrl]);
+
+  // A read-only task (triage) stays on the default branch. Creating `agent/issue-<n>` for it would
+  // either invent a branch nothing will ever push, or check out an earlier task's unmerged work and
+  // describe that as the current state of the code.
+  if (readOnly) {
+    // Fetch URL kept so tooling can still tell which repository this is; pushes are made to fail on
+    // an unknown transport, so "do not push" is enforced by git rather than only by the prompt.
+    await g.run(['config', 'remote.origin.pushurl', READ_ONLY_PUSH_URL]);
+    logger.log(`[Repo] ${slug} #${issueNumber}: read-only clone on ${effectiveDefault}`);
+    return {
+      clonePath,
+      mirror,
+      defaultBranch: effectiveDefault,
+      branch: effectiveDefault,
+      resume: false,
+      startPoint: `origin/${effectiveDefault}`,
+      readOnly: true,
+    };
+  }
+
   await g.run(['switch', '--create', plan.branch, plan.startPoint]);
 
   logger.log(
@@ -184,6 +208,25 @@ export async function createStartCommit({ clonePath, issueNumber, branch, logger
 
 export async function pushBranch({ clonePath, branch }) {
   await git(clonePath).run(['push', '--set-upstream', 'origin', branch]);
+}
+
+/**
+ * The commit GitHub actually has for this branch, which is what any deployment was built from.
+ *
+ * Not the same as local HEAD: the agent pushes from inside the container against this very clone,
+ * so the remote-tracking ref is current, but it may also have committed without pushing. HEAD is
+ * the fallback only for the case where the branch was never pushed at all.
+ */
+export async function readPushedSha({ clonePath, branch }) {
+  const g = git(clonePath);
+  for (const rev of [`refs/remotes/origin/${branch}`, 'HEAD']) {
+    try {
+      return await g.capture(['rev-parse', rev]);
+    } catch {
+      // Ref is missing; try the next one.
+    }
+  }
+  return null;
 }
 
 /**

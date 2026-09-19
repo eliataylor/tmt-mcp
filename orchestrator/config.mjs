@@ -194,6 +194,15 @@ export function loadConfig({ envFile = '.env.orchestrator', cwd = process.cwd() 
       keepArtifacts: process.env.KEEP_ARTIFACTS || 'on-failure',
     },
 
+    // Waiting for a preview build holds the task lease, so both waits are deliberately short:
+    // graceMs only has to outlast the gap between a push and the deployment record appearing.
+    preview: {
+      enabled: envFlag('PREVIEW_COMMENTS', true),
+      graceMs: num('PREVIEW_GRACE_MS', 45000),
+      timeoutMs: num('PREVIEW_TIMEOUT_MS', 180000),
+      intervalMs: num('PREVIEW_POLL_INTERVAL_MS', 5000),
+    },
+
     runner: {
       image: process.env.RUNNER_IMAGE || 'tmt-agent-runner',
       network: process.env.RUNNER_NETWORK || 'tmt-agent-runners',
