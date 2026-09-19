@@ -16,6 +16,7 @@ export const PROJECT = {
   repo_key: 'my-org/primary-app',
   default_branch: 'main',
   trigger_label: 'agent:assigned',
+  execute_label: 'agent:execute',
   mention: '@dev-agent',
   agent_login: 'dev-agent',
   webhook_secret_env: null,

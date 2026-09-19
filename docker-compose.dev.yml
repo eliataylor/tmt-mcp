@@ -13,6 +13,17 @@ networks:
   agent-net:
     driver: bridge
 
+  # Runner containers are started by the orchestrator with `docker run`, not by compose, but the
+  # network is declared here so both halves agree on it. `name:` pins the real network name so the
+  # orchestrator can reference it without the compose project prefix.
+  #
+  # A user-defined bridge only connects containers attached to it, so a runner cannot reach the
+  # queue, cloudflared, or another runner, while outbound NAT still gives it the Cursor API, the
+  # GitHub API, and npm. That isolation is what lets the runner hold no queue credential at all.
+  tmt-agent-runners:
+    name: tmt-agent-runners
+    driver: bridge
+
 services:
   webhook-server:
     build:
@@ -23,13 +34,16 @@ services:
     env_file: .env
     environment:
       PORT: 3000
+      CONTROL_PORT: 3001
       DB_PATH: /app/data/agent_queue.db
       PROJECTS_CONFIG: /config/projects.json
       TUNNEL_METRICS_URL: http://cloudflare-tunnel:2000
     ports:
-      # Bound to loopback: only the host orchestrator polls this. Public traffic arrives
-      # through the tunnel over the internal network instead.
-      - "127.0.0.1:${HOST_PORT:-3000}:3000"
+      # Only the control listener is published, and only to loopback. The webhook listener on 3000
+      # is deliberately absent: cloudflared reaches it by service name over agent-net, so it needs
+      # no host port at all. Publishing it would put the queue on the LAN, and Docker Desktop's
+      # publishing bypasses the macOS application firewall so there would be no prompt.
+      - "127.0.0.1:${CONTROL_HOST_PORT:-3001}:3001"
     volumes:
       - ./sqlite_data/${DATA_DIR:-shared}:/app/data
       - ./config:/config:ro

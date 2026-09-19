@@ -8,10 +8,30 @@ import { classify } from './triggers.mjs';
 import { buildContext } from './context.mjs';
 import * as queue from './queue.mjs';
 import { announceWebhookUrl } from './tunnel.mjs';
+import { controlPlaneGuard, githubSourceGuard } from './net-guards.mjs';
+import { createGithubMeta } from './github-meta.mjs';
 
 export function loadConfig(env = process.env) {
+  const controlPort = Number(env.CONTROL_PORT || 3001);
   return {
     port: Number(env.PORT || 3000),
+    controlPort,
+    // Inside the container both listeners bind 0.0.0.0. Reachability is decided by compose: the
+    // webhook port is never published, and the control port is published to 127.0.0.1 only.
+    bindAddress: env.BIND_ADDRESS || '0.0.0.0',
+    controlAllowedHosts: (
+      env.CONTROL_ALLOWED_HOSTS || `127.0.0.1:${controlPort},localhost:${controlPort}`
+    )
+      .split(',')
+      .map((h) => h.trim())
+      .filter(Boolean),
+    controlRequireLoopbackPeer: env.CONTROL_REQUIRE_LOOPBACK_PEER === 'true',
+    // 'enforce' (default) | 'warn' | 'off'. 'off' also skips the /meta fetch entirely.
+    webhookIpCheck: ['warn', 'off', 'false'].includes(env.WEBHOOK_IP_CHECK)
+      ? env.WEBHOOK_IP_CHECK === 'false'
+        ? 'off'
+        : env.WEBHOOK_IP_CHECK
+      : 'enforce',
     dbPath: env.DB_PATH || DEFAULT_DB_PATH,
     pollSecret: env.AGENT_POLL_SECRET || '',
     leaseSeconds: Number(env.LEASE_SECONDS || 1800),
@@ -34,7 +54,7 @@ export function createLogger(scope = 'Server', sink = console) {
   };
 }
 
-export function createApp({ db, registry, config, log = createLogger() }) {
+function baseApp(limit) {
   const app = express();
   app.disable('x-powered-by');
 
@@ -42,15 +62,18 @@ export function createApp({ db, registry, config, log = createLogger() }) {
   // re-serializing the parsed object does not reproduce them.
   app.use(
     express.json({
-      limit: '10mb',
+      limit,
       verify: (req, _res, buf) => {
         req.rawBody = buf;
       },
     })
   );
+  return app;
+}
 
-  // ---------------------------------------------------------------- webhook
+// ---------------------------------------------------------------- webhook
 
+function mountWebhookRoutes(app, { db, registry, config, log }) {
   app.post('/api/agent/webhook', (req, res) => {
     const event = req.get('x-github-event') || 'unknown';
     const deliveryId = req.get('x-github-delivery') || null;
@@ -146,8 +169,12 @@ export function createApp({ db, registry, config, log = createLogger() }) {
     });
   });
 
-  // ---------------------------------------------------------------- orchestrator
+  return app;
+}
 
+// ---------------------------------------------------------------- orchestrator
+
+function mountControlRoutes(app, { db, registry, config, log }) {
   const guard = requireBearer(() => config.pollSecret);
 
   app.post('/api/agent/poll', guard, (req, res) => {
@@ -230,6 +257,10 @@ export function createApp({ db, registry, config, log = createLogger() }) {
     });
   });
 
+  return app;
+}
+
+function mountFallbacks(app, log) {
   app.use((req, res) => res.status(404).json({ error: `No route for ${req.method} ${req.path}` }));
 
   // eslint-disable-next-line no-unused-vars -- Express identifies error handlers by arity.
@@ -240,6 +271,54 @@ export function createApp({ db, registry, config, log = createLogger() }) {
   });
 
   return app;
+}
+
+/**
+ * The tunnel-facing app. Mounts only the webhook route, so the public quick-tunnel hostname
+ * exposes nothing else.
+ *
+ * `cloudflared tunnel --url http://webhook-server:3000` proxies every path it can reach, so with a
+ * single combined app the orchestrator's endpoints would be live on a public trycloudflare.com
+ * hostname — brute-forceable, unrate-limited, and with /api/health handing a scanner the SQLite
+ * version and task counts. Those subdomains do get scanned; the random name is not secret-grade.
+ */
+export function createWebhookApp({ db, registry, config, log = createLogger('Webhook'), meta = null }) {
+  const app = baseApp('10mb');
+  if (meta && config.webhookIpCheck !== 'off') {
+    app.use(githubSourceGuard(meta, { mode: config.webhookIpCheck, logger: log }));
+  }
+  mountWebhookRoutes(app, { db, registry, config, log });
+  return mountFallbacks(app, log);
+}
+
+/**
+ * The orchestrator-facing app: everything the daemon uses, on a listener the tunnel cannot reach
+ * and a browser cannot address. See src/net-guards.mjs for why the header checks are enough.
+ */
+export function createControlApp({ db, registry, config, log = createLogger('Control') }) {
+  const app = baseApp('1mb');
+  if (config.controlAllowedHosts?.length) {
+    app.use(
+      controlPlaneGuard({
+        allowedHosts: config.controlAllowedHosts,
+        requireLoopbackPeer: config.controlRequireLoopbackPeer,
+        logger: log,
+      })
+    );
+  }
+  mountControlRoutes(app, { db, registry, config, log });
+  return mountFallbacks(app, log);
+}
+
+/**
+ * Both surfaces on one app. Used by the tests and by anyone running the server directly on the
+ * host; the split listeners in main() are what production uses.
+ */
+export function createApp({ db, registry, config, log = createLogger() }) {
+  const app = baseApp('10mb');
+  mountWebhookRoutes(app, { db, registry, config, log });
+  mountControlRoutes(app, { db, registry, config, log });
+  return mountFallbacks(app, log);
 }
 
 /** Explain a 409 precisely: unknown id versus wrong status. */
@@ -265,7 +344,7 @@ export function startReaper(db, { intervalSeconds, backoffSeconds }, log) {
   return timer;
 }
 
-export function main() {
+export async function main() {
   const log = createLogger();
   const config = loadConfig();
 
@@ -284,12 +363,39 @@ export function main() {
       : `Shared mode: serving ${registry.slugs().length} project(s) [${registry.slugs().join(', ')}]`
   );
 
-  const app = createApp({ db, registry, config, log });
+  // Source-IP verification is defense in depth behind the HMAC. A failure to load the ranges is
+  // logged and skipped rather than dropping every delivery.
+  let meta = null;
+  let metaRefresher = null;
+  if (config.webhookIpCheck === 'off') {
+    log.info('Source-IP verification disabled (WEBHOOK_IP_CHECK); HMAC only');
+  } else {
+    meta = createGithubMeta();
+    const metaResult = await meta.refresh();
+    log.info(
+      metaResult.ok
+        ? `Loaded ${metaResult.count} GitHub hooks CIDR range(s)`
+        : `Could not load GitHub hooks ranges (${metaResult.error.message}); source-IP checks skipped`
+    );
+    metaRefresher = setInterval(() => meta.refresh(), 6 * 60 * 60 * 1000);
+    metaRefresher.unref();
+  }
+
+  const webhookApp = createWebhookApp({ db, registry, config, log: createLogger('Webhook'), meta });
+  const controlApp = createControlApp({ db, registry, config, log: createLogger('Control') });
   const reaper = startReaper(db, config, log);
 
-  const server = app.listen(config.port, () => {
-    log.info(`Listening on port ${config.port}`);
+  const server = webhookApp.listen(config.port, config.bindAddress, () => {
+    // Never published to the host; only cloudflared on agent-net reaches this.
+    log.info(`Webhook listener on ${config.bindAddress}:${config.port} (tunnel only)`);
     announceWebhookUrl((msg) => log.info(msg), { metricsUrl: config.tunnelMetricsUrl });
+  });
+
+  const controlServer = controlApp.listen(config.controlPort, config.bindAddress, () => {
+    log.info(
+      `Control listener on ${config.bindAddress}:${config.controlPort} ` +
+        `(published to loopback only; Host allowlist: ${config.controlAllowedHosts.join(', ')})`
+    );
   });
 
   process.on('SIGHUP', () => {
@@ -304,6 +410,8 @@ export function main() {
   const shutdown = (signal) => {
     log.info(`${signal} received, shutting down`);
     clearInterval(reaper);
+    clearInterval(metaRefresher);
+    controlServer.close();
     server.close(() => {
       db.close();
       process.exit(0);
@@ -313,9 +421,12 @@ export function main() {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  return { app, server, db, registry };
+  return { webhookApp, controlApp, server, controlServer, db, registry };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main();
+  main().catch((err) => {
+    console.error(`Failed to start: ${err.stack || err.message}`);
+    process.exit(1);
+  });
 }

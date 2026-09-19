@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 export const DEFAULTS = {
   default_branch: 'main',
   trigger_label: 'agent:assigned',
+  execute_label: 'agent:execute',
   mention: '@dev-agent',
 };
 
@@ -32,6 +33,7 @@ function normalizeProject(raw, index) {
     repo_key: raw.repo.toLowerCase(),
     default_branch: raw.default_branch || DEFAULTS.default_branch,
     trigger_label: raw.trigger_label || DEFAULTS.trigger_label,
+    execute_label: raw.execute_label || DEFAULTS.execute_label,
     mention: raw.mention || DEFAULTS.mention,
     agent_login: raw.agent_login || null,
     webhook_secret_env: raw.webhook_secret_env || null,

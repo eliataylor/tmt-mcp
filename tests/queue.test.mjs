@@ -199,15 +199,24 @@ describe('reap', () => {
 });
 
 describe('cancelPending', () => {
-  test('closing an issue clears its queued work but not work in flight', () => {
+  test('closing an issue cancels queued work and work in flight', () => {
     add('d1');
     add('d2', { action: 'comment_created' });
     const inFlight = queue.claim(db, {});
 
     const cancelled = queue.cancelPending(db, { projectSlug: 'main-app', issueNumber: 42, reason: 'issue closed' });
-    assert.equal(cancelled.length, 1);
-    assert.equal(queue.getTask(db, inFlight.id).status, 'processing');
-    assert.equal(queue.getTask(db, cancelled[0]).last_error, 'issue closed');
+    // Both rows go: the orchestrator notices the in-flight one left 'processing' on its next
+    // heartbeat and stops the container.
+    assert.equal(cancelled.length, 2);
+    assert.equal(queue.getTask(db, inFlight.id).status, 'cancelled');
+    assert.equal(queue.getTask(db, inFlight.id).last_error, 'issue closed');
+  });
+
+  test('a cancelled in-flight task can no longer be heartbeat, which is the stop signal', () => {
+    add('d1');
+    const inFlight = queue.claim(db, {});
+    queue.cancelPending(db, { projectSlug: 'main-app', issueNumber: 42, reason: 'issue closed' });
+    assert.equal(queue.heartbeat(db, inFlight.id, 60), null);
   });
 
   test('another issue is untouched', () => {

@@ -6,6 +6,12 @@
  *   npm run replay
  *   node scripts/replay-delivery.mjs --fixture issue_comment.created.json --event issue_comment
  *   node scripts/replay-delivery.mjs --base http://localhost:3000 --leave-pending
+ *
+ * The webhook and the control endpoints are separate listeners, so this needs two bases: --base is
+ * the webhook, --control-base is everything else (default: --base with the port bumped by one).
+ * Under `npm run dev` both are on the host. Under compose the webhook port is deliberately
+ * unpublished, so only --control-base is reachable and the delivery steps will fail — that is the
+ * expected topology, not a bug.
  */
 import { readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
@@ -15,6 +21,7 @@ import { signBody } from '../src/auth.mjs';
 const { values } = parseArgs({
   options: {
     base: { type: 'string', default: process.env.QUEUE_BASE_URL || 'http://127.0.0.1:3000' },
+    'control-base': { type: 'string', default: process.env.QUEUE_CONTROL_BASE_URL || '' },
     fixture: { type: 'string', default: 'issues.labeled.json' },
     event: { type: 'string', default: 'issues' },
     delivery: { type: 'string' },
@@ -31,8 +38,20 @@ if (values.help) {
 }
 
 const base = values.base.replace(/\/$/, '');
+const control = (values['control-base'] || defaultControlBase(base)).replace(/\/$/, '');
 const deliveryId = values.delivery || `replay-${Date.now()}`;
 const pollSecret = values['poll-secret'];
+
+/** The control listener sits one port above the webhook, matching the compose defaults. */
+function defaultControlBase(webhookBase) {
+  try {
+    const url = new URL(webhookBase);
+    url.port = String((Number(url.port) || 80) + 1);
+    return url.origin;
+  } catch {
+    return webhookBase;
+  }
+}
 
 function fail(message) {
   console.error(`FAIL  ${message}`);
@@ -55,8 +74,8 @@ async function readJson(response) {
 }
 
 // 1. Health -----------------------------------------------------------------
-const health = await fetch(`${base}/api/health`).catch(() => null);
-if (!health?.ok) fail(`${base}/api/health is unreachable. Is the server running?`);
+const health = await fetch(`${control}/api/health`).catch(() => null);
+if (!health?.ok) fail(`${control}/api/health is unreachable. Is the server running?`);
 const healthBody = await readJson(health);
 step('health', `sqlite ${healthBody.sqlite_version}, ${healthBody.mode} mode, projects: ${healthBody.projects.join(', ') || 'none'}`);
 
@@ -99,7 +118,7 @@ if (values['leave-pending']) {
 }
 
 // 4. Claim ------------------------------------------------------------------
-const polled = await fetch(`${base}/api/agent/poll`, {
+const polled = await fetch(`${control}/api/agent/poll`, {
   method: 'POST',
   headers: authHeaders,
   body: JSON.stringify({ worker: 'replay-script' }),
@@ -122,7 +141,7 @@ for (const file of ctx.references.files) {
 }
 
 // 5. Heartbeat --------------------------------------------------------------
-const beat = await fetch(`${base}/api/agent/tasks/${task.id}/heartbeat`, {
+const beat = await fetch(`${control}/api/agent/tasks/${task.id}/heartbeat`, {
   method: 'POST',
   headers: authHeaders,
   body: JSON.stringify({ lease_seconds: 120 }),
@@ -132,7 +151,7 @@ if (!beatBody.ok) fail(`heartbeat failed: ${JSON.stringify(beatBody)}`);
 step('heartbeat', `lease extended to ${beatBody.lease_expires_at}`);
 
 // 6. Complete ---------------------------------------------------------------
-const completed = await fetch(`${base}/api/agent/tasks/${task.id}/complete`, {
+const completed = await fetch(`${control}/api/agent/tasks/${task.id}/complete`, {
   method: 'POST',
   headers: authHeaders,
 });
@@ -143,7 +162,7 @@ if (completedBody.task?.status !== 'completed') {
 step('complete', `task ${task.id} is ${completedBody.task.status}`);
 
 // 7. Completing twice must not silently succeed -----------------------------
-const again = await fetch(`${base}/api/agent/tasks/${task.id}/complete`, { method: 'POST', headers: authHeaders });
+const again = await fetch(`${control}/api/agent/tasks/${task.id}/complete`, { method: 'POST', headers: authHeaders });
 if (again.status !== 409) fail(`expected 409 on a second complete, got ${again.status}`);
 step('idempotency', 'a second complete is rejected with 409');
 

@@ -1,0 +1,45 @@
+{
+  "//": "Host-side orchestrator settings. Copy to config/orchestrator.json. Identity (slug, repo, default_branch, trigger_label) stays in projects.json; this file only adds what the queue has no business knowing.",
+
+  "defaults": {
+    "agent": {
+      "model": "auto",
+      "setup_cmd": null,
+      "timeout_ms": null
+    },
+    "env_template": {}
+  },
+
+  "projects": {
+    "matchbear": {
+      "//": "Slug must match projects.json. local_path seeds the mirror without network auth when present.",
+      "local_path": "/Users/trackauthoritymusic/Developer/matchbear/Demo",
+      "clone_url": "git@github.com:eliataylor/nextjs.git",
+
+      "neon": {
+        "//": "Omit this whole block for projects that need no database branch.",
+        "project_id": "odd-field-25990477",
+        "parent_branch": "main",
+        "//init_source": "parent-schema copies schema only. Switch to parent-data only if the agent genuinely needs seeded rows; it copies the parent's entire dataset into a database the agent can read.",
+        "init_source": "parent-schema"
+      },
+
+      "agent": {
+        "model": "auto",
+        "setup_cmd": "npm ci"
+      },
+
+      "//env_template": "Merged into .env.local in the clone, under the DATABASE_URL and GITHUB_ISSUE_NUMBER the orchestrator adds. Never put a real secret here; this file is committed.",
+      "env_template": {
+        "NEXT_PUBLIC_ENVIRONMENT": "development",
+        "NEXT_PUBLIC_API_URL": "http://localhost:3000"
+      }
+    },
+
+    "side-project": {
+      "agent": {
+        "setup_cmd": "npm install"
+      }
+    }
+  }
+}

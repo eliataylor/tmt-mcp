@@ -1,6 +1,7 @@
 {
   "mcpServers": {
     "github": {
+      "comment": "Plan-mode agent tasks: get_issue, get_issue_comments, and post issue comments via MCP. Runners use github-mcp-server (see docker/agent-entrypoint.sh).",
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
       "env": {

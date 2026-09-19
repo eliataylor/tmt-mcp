@@ -190,7 +190,11 @@ export function heartbeat(db, id, leaseSeconds) {
 
 /**
  * Drop an issue's queued work when it is closed or loses the trigger label.
- * Tasks already in flight are left alone; cancelling the row would not stop the worker.
+ *
+ * This deliberately covers 'processing' as well as 'pending'. Cancelling the row does not by
+ * itself stop a running container, but the orchestrator re-reads its row on every heartbeat and
+ * stops the container as soon as the task has left 'processing' — so touching these rows is what
+ * makes "close the issue to call the agent off" actually work.
  */
 export function cancelPending(db, { projectSlug, issueNumber, reason = 'cancelled' }) {
   return db
@@ -198,9 +202,11 @@ export function cancelPending(db, { projectSlug, issueNumber, reason = 'cancelle
       `UPDATE agent_tasks
           SET status = 'cancelled',
               last_error = @reason,
+              lease_expires_at = NULL,
               completed_at = datetime('now'),
               updated_at = datetime('now')
-        WHERE project_slug = @slug AND github_issue_number = @number AND status = 'pending'
+        WHERE project_slug = @slug AND github_issue_number = @number
+          AND status IN ('pending', 'processing')
        RETURNING id`
     )
     .all({ slug: projectSlug, number: issueNumber, reason })

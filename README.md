@@ -81,12 +81,28 @@ name instead.
 
 | Event | Condition | Result |
 | --- | --- | --- |
-| `issues.labeled` | label matches `trigger_label` | queue `agent:assigned` |
-| `issues.assigned` | assignee matches `agent_login` | queue `agent:assigned` |
-| `issues.opened` / `reopened` | issue already carries `trigger_label` | queue `agent:opened` |
-| `issue_comment.created` | body contains `mention`, or the issue carries `trigger_label` | queue `comment_created` |
+| `issues.labeled` | label matches `trigger_label` | queue `agent:assigned` (**plan** — issue comment only) |
+| `issues.labeled` | label matches `execute_label` (default `agent:execute`) | queue `agent:execute` (**implement** on the task branch) |
+| `issues.assigned` | assignee matches `agent_login` | queue `agent:assigned` (plan) |
+| `issues.opened` / `reopened` | issue carries `execute_label` | queue `agent:execute` |
+| `issues.opened` / `reopened` | issue carries `trigger_label` (and not execute) | queue `agent:opened` (plan) |
+| `issue_comment.created` | author is a `Bot`, or matches `agent_login` | ignored — the agent must not answer itself |
+| `issue_comment.created` | body contains `mention` | queue `comment_created` (plan) or `agent:execute` if `execute_label` is on the issue |
+| `issue_comment.created` | issue carries `execute_label` | queue `agent:execute` |
+| `issue_comment.created` | issue carries `trigger_label` only | queue `comment_created` (plan) |
 | `issues.closed` | — | cancel that issue's pending tasks |
 | `issues.unlabeled` | label matches `trigger_label` | cancel that issue's pending tasks |
+
+Plan mode's deliverable is an issue comment, posted while the trigger label is still on the
+issue — so the author check above is what keeps the agent from triggering itself in a loop.
+It only holds if `GITHUB_TOKEN` belongs to the agent and not to a human: with a shared personal
+token the agent posts under your login, and setting `agent_login` to that login would silence
+your own comments too. Give the agent its own machine user or GitHub App before relying on it.
+
+Optional per-project override: `execute_label` in `projects.json` (default `agent:execute`).
+Removing `execute_label` does **not** cancel queued work; only losing `trigger_label` or closing the issue does.
+
+**Typical flow:** add `agent:assigned` → agent posts plan/questions on the issue → human adds `agent:execute` → agent implements.
 
 Everything else gets a 200 with `{ "ignored": true }` so GitHub does not keep retrying.
 
@@ -122,9 +138,10 @@ and every reference records which of the two it came from:
 
 **A webhook payload never contains the comment thread** — an `issues` event carries only the
 body, and an `issue_comment` event carries only the one comment. So `fetch` states how many
-comments exist and where to get them, which is exactly what step 1 of
+comments exist and where to get them, which is exactly what
 [.cursor/rules/agent-instructions.md](.cursor/rules/agent-instructions.md) tells the agent to
-do with `get_issue_comments`. The `references.files` array feeds step 2's codebase scan;
+load via GitHub MCP (`get_issue`, `get_issue_comments`) and where to post plan replies (issue
+comment via MCP). The `references.files` array feeds the codebase scan;
 paths are picked up from blob permalinks, backticked paths with `:10-20` suffixes, bare
 path-shaped tokens (including inside pasted stack traces), and `path=` on a code fence.
 
@@ -143,6 +160,34 @@ All `/api/agent/*` endpoints except the webhook require `Authorization: Bearer $
 - `POST /api/agent/tasks/:id/heartbeat` — extend the lease on a long-running task.
 - `GET /api/agent/tasks?status=&project_slug=&limit=` — inspection.
 - `GET /api/health` — SQLite version, journal mode, mode, tenants, task counts. Unauthenticated.
+
+### Two listeners, not one
+
+The webhook is the only thing the tunnel can reach. Everything else is on a second listener
+bound to loopback:
+
+| Listener | Port | Reachable from | Routes |
+| --- | --- | --- | --- |
+| Webhook | 3000, **not published** | cloudflared over `agent-net` | `POST /api/agent/webhook` |
+| Control | 3001, published to `127.0.0.1` only | the host orchestrator | `poll`, `tasks`, `complete`, `fail`, `heartbeat`, `health` |
+
+`cloudflared tunnel --url http://webhook-server:3000` proxies every path it can reach, so a
+single combined app would put `/api/agent/poll` and `/api/agent/tasks` on a public
+`trycloudflare.com` hostname — brute-forceable, unrate-limited — and `/api/health` would hand
+any scanner the SQLite version and task counts. Those subdomains do get scanned; the random
+name is not secret-grade.
+
+Loopback alone does not stop a browser, because DNS rebinding re-resolves an attacker's domain
+to `127.0.0.1` so the page's requests look same-origin. Three header checks close that, and a
+CLI satisfies all three for free ([`src/net-guards.mjs`](src/net-guards.mjs)):
+
+- `Host` must be in `CONTROL_ALLOWED_HOSTS` — a rebinding attempt arrives with the attacker's hostname
+- no `Origin` header at all, since a CLI never sends one
+- no `Sec-Fetch-Site` or `Sec-Fetch-Mode`, which browsers set and page JavaScript cannot strip
+
+Webhook deliveries are additionally checked against the `hooks` CIDRs from
+`api.github.com/meta`, read from `CF-Connecting-IP`. That is defense in depth behind the HMAC,
+and a failure to load the ranges logs and skips rather than dropping every delivery.
 
 A claimed task is leased for `LEASE_SECONDS`. If the orchestrator dies, the reaper returns
 the task to `pending` (or `failed` once attempts are spent) rather than leaving it stuck in
@@ -167,15 +212,133 @@ at the agent-runner layer, which spawns a container per issue.
 Isolated mode exists for genuine blast-radius or commingling requirements:
 
 ```bash
-cp .env .env.main-app     # set PROJECT_SLUG=main-app, HOST_PORT=3001, DATA_DIR=main-app
+cp .env .env.main-app     # set PROJECT_SLUG=main-app, CONTROL_HOST_PORT=3011, DATA_DIR=main-app
 docker compose -p main-app --env-file .env.main-app \
   -f docker-compose.dev.yml -f docker-compose.project.yml up -d
 ```
 
 `PROJECT_SLUG` pins the instance to one project and rejects every other repo, even one
 present in the same `projects.json`, and makes `/api/agent/poll` ignore a mismatched slug
-from the caller. Each stack needs its own `HOST_PORT` and `DATA_DIR`, and brings up its own
-tunnel with its own hostname.
+from the caller. Each stack needs its own `CONTROL_HOST_PORT` and `DATA_DIR`, and brings up its
+own tunnel with its own hostname.
+
+Runner containers live on a third network, `tmt-agent-runners`, declared in the compose file but
+populated by the orchestrator's `docker run`. A user-defined bridge only connects containers
+attached to it, so a runner cannot reach the queue, cloudflared, or another runner, while
+outbound NAT still gives it the Cursor API, the GitHub API, and npm. That isolation is what lets
+a runner hold no queue credential at all.
+
+### Why the control plane is TCP and not a unix socket
+
+A unix socket would be strictly better — browsers cannot address one, so CORS reasoning and DNS
+rebinding both stop being relevant. It does not work here, and this was measured rather than
+assumed: a socket bound inside the queue container on a Docker Desktop bind mount **does** show
+up on the host as a socket inode over VirtioFS, but connecting to it fails with `ECONNREFUSED`
+from both `node:http`'s `socketPath` and `curl --unix-socket`. The socket itself does not cross
+the VM boundary — the same class of problem as the WAL `-shm` caveat below.
+
+So the control plane is loopback TCP with the header guards above. `QUEUE_CONTROL_SOCKET` still
+exists in the orchestrator config for the case where the queue runs directly on the host.
+
+A user-defined bridge does **not** by itself keep a runner away from the host's published ports:
+measured on Docker Desktop, a container on `tmt-agent-runners` still resolves
+`host.docker.internal` (to an IPv6 ULA) and reaches a port published on the macOS host. That is
+what `--add-host host.docker.internal:127.0.0.1` and `--add-host gateway.docker.internal:127.0.0.1`
+are for, and they are load-bearing rather than belt-and-braces: with them, the same request fails
+to connect at all.
+
+The honest residual, all three states verified against a live control listener:
+
+| From a runner | Result |
+| --- | --- |
+| `host.docker.internal:3301`, aliases blackholed | connection refused |
+| Reaching the host address, `Host` header left alone | `403` — the Host allowlist rejects it |
+| Reaching the host address **and** forging `Host: 127.0.0.1:3301` | `/api/health` returns `200`; `/api/agent/poll` returns `401` |
+
+So a container that hardcodes the Docker Desktop host address and forges the Host header can read
+the unauthenticated health endpoint — SQLite version and task counts — and nothing more. Claiming
+or completing work needs `AGENT_POLL_SECRET`, which is exactly why the runner is never given it.
+
+## Host orchestrator
+
+`orchestrator/` is the host-side daemon that drains the queue. It runs as you, on the host, not
+in a container — it needs to run `docker`, and a containerized orchestrator would need the Docker
+socket, which is root-equivalent and would undo every hardening flag below.
+
+```bash
+cp config/orchestrator.example.json config/orchestrator.json
+# copy the .env.orchestrator block out of .env.example, fill in the secrets
+npm run runner:build
+npm run orchestrator
+```
+
+Boot fails loudly rather than half-working: it checks the queue's health endpoint, `docker info`,
+the runner image, `git --version`, and every configured project's `local_path`. Herdr is probed
+too but is optional unless `HERDR_REQUIRED=true`.
+
+The loop is `setTimeout`-based rather than `setInterval`, so a slow poll cannot stack up
+overlapping ticks, and it polls only while under `MAX_CONCURRENT_TASKS`. Per task:
+
+1. **Clone.** A `--mirror` cache per project is fetched once, then `git clone --local` gives each
+   task its own working copy in `~/.tmt-agent/clones/<slug>-issue-<n>-<taskid>`, hardlinked so it
+   costs almost nothing. Not `git worktree`: worktrees share one `.git`, so a `git gc` or a stray
+   `reset --hard` in one task can corrupt its siblings, and they leave a `.git/worktrees` entry in
+   the developer's repo. The clone's `origin` is HTTPS (tokenless URL; the runner's credential
+   helper supplies `GITHUB_TOKEN`). Host mirror fetch can use SSH via `clone_url` or `fetch_url` in
+   `config/orchestrator.json` — your ssh-agent on the Mac, no PAT prompt — while pushes from the
+   container still use HTTPS.
+2. **Branch.** `agent/issue-<n>`, created from the project's default branch, or checked out and
+   fast-forwarded if it already exists so a follow-up comment continues the same PR.
+3. **PR.** An empty commit, a push, then a draft PR (falling back to a normal PR when the plan
+   rejects drafts), then a comment on the issue linking it. Opening the PR up front means the
+   human watches the diff arrive rather than waiting for a finished branch.
+4. **Neon.** For projects with a `neon` block, an ephemeral branch off `parent_branch`, giving the
+   runner a real `DATABASE_URL` in `.env.local` that it can migrate against and cannot use to
+   damage anything shared.
+5. **Run.** The container, wrapped in a Herdr pane when Herdr is up so you can watch it.
+6. **Relay.** `result.json` from `/out` decides `complete` or `fail`; a heartbeat every
+   `HEARTBEAT_INTERVAL_SECONDS` keeps the lease and doubles as the cancellation channel — a task
+   moved to `canceled` (by closing the issue or removing the label) stops the container.
+
+Secrets reach the runner as a single 0600 `secrets.env` bind-mounted at `/run/secrets/env`, never
+as `-e` flags: `docker inspect` and `ps` both expose environment variables to any process on the
+host, and Docker persists them in container JSON. The file is shredded after the run. It carries
+only `GITHUB_TOKEN` and `CURSOR_API_KEY`; `NEON_API_KEY` is asserted absent, since it is
+org-scoped and could delete whole projects while the runner only ever needs the `DATABASE_URL`
+that came out of it.
+
+The container gets `--cap-drop ALL --security-opt no-new-privileges --read-only`, a tmpfs `/tmp`,
+and pid/memory/cpu/nofile limits, with writes confined to `/workspace`, `/out`, `/home/agent`, and
+`/tmp`. The mount list is an exact allowlist asserted by a test. Nothing else is mounted — in
+particular not the Docker socket, not the Herdr socket, not `~/.ssh`, `~/.gitconfig`, `~/.cursor`,
+or `~/.aws`, not the mirror cache, and not the developer's checkout.
+
+```bash
+npm run orchestrator:dry-run     # print every command and payload for a fixture, run nothing
+npm run gc                       # report orphaned containers, old clones, unused volumes
+npm run gc -- --older-than 3d --volumes --apply    # nothing is deleted without --apply
+```
+
+`scripts/dry-run-task.mjs` is the cheap way to see what a delivery would do: it prints the
+resolved branch plan, the `docker run` argv, the rendered prompt, and the Neon request body
+without touching the network, Docker, or git.
+
+### Secrets on the host
+
+The three long-lived credentials default to `.env.orchestrator`, which is `.gitignore`d and
+should be `chmod 600`. Setting `SECRETS_FROM_KEYCHAIN=true` reads them from the macOS Keychain
+instead:
+
+```bash
+security add-generic-password -s tmt-agent -a GITHUB_TOKEN -w
+security add-generic-password -s tmt-agent -a CURSOR_API_KEY -w
+security add-generic-password -s tmt-agent -a NEON_API_KEY -w
+```
+
+Worth doing: Keychain ACLs prompt per binary, whereas a plaintext file under `~/.tmt-agent` or
+`~/Developer` is readable by anything running as you — neither path is TCC-protected. Use a
+fine-grained PAT scoped to the agent's repos (`contents:write`, `pull_requests:write`,
+`issues:write`, `metadata:read`) so a runaway container cannot reach the rest of the org.
 
 ## Reading the queue directly
 
@@ -195,11 +358,19 @@ not cross the macOS VM boundary reliably. Host-side reads can be stale or hit lo
 | `AGENT_POLL_SECRET` | Bearer token for the orchestrator endpoints |
 | `PROJECTS_CONFIG` | Registry path, default `/config/projects.json` |
 | `PROJECT_SLUG` | Isolated mode only; pins the instance to one project |
-| `DB_PATH`, `PORT` | SQLite file and listen port |
-| `HOST_PORT`, `DATA_DIR` | Compose-only: published loopback port and data subdirectory |
+| `DB_PATH`, `PORT` | SQLite file and webhook listen port |
+| `CONTROL_PORT` | Control listener port inside the container, default `3001` |
+| `CONTROL_HOST_PORT`, `DATA_DIR` | Compose-only: published loopback port and data subdirectory |
+| `CONTROL_ALLOWED_HOSTS` | Accepted `Host` values on the control listener |
+| `CONTROL_REQUIRE_LOOPBACK_PEER` | Also require a loopback peer IP; off by default because Docker Desktop rewrites it to the gateway |
+| `WEBHOOK_IP_CHECK` | Verify delivery source IPs against `api.github.com/meta`, default `true` |
 | `ALLOW_UNKNOWN_REPOS` | Accept repos absent from the registry, default `false` |
 | `LEASE_SECONDS`, `MAX_ATTEMPTS`, `RETRY_BACKOFF_SECONDS`, `REAPER_INTERVAL_SECONDS` | Queue behaviour |
 | `TUNNEL_METRICS_URL` | cloudflared metrics endpoint used to log the webhook URL |
+
+Orchestrator variables live in `.env.orchestrator`; the annotated block is at the bottom of
+[`.env.example`](.env.example). Keeping them out of `.env` is deliberate — the queue container's
+`env_file` should hold only the webhook and poll secrets.
 
 ## Development
 
@@ -216,13 +387,22 @@ deduplicated, then polls, heartbeats, and completes — no GitHub and no tunnel 
 Layout:
 
 ```
-src/     server.mjs db.mjs auth.mjs projects.mjs triggers.mjs
-         context.mjs references.mjs queue.mjs tunnel.mjs
+src/            server.mjs db.mjs auth.mjs projects.mjs triggers.mjs
+                context.mjs references.mjs queue.mjs tunnel.mjs
+                net-guards.mjs github-meta.mjs
+orchestrator/   index.mjs config.mjs queue-client.mjs exec.mjs repo.mjs
+                github.mjs neon.mjs taskdir.mjs prompt.mjs runner.mjs
+                herdr.mjs state.mjs
 db/schema.sql            applied idempotently at boot
 config/                  tenant registry (projects.json is gitignored)
-docker/                  server image and the agent-runner image
+docker/                  server image, agent-runner image, agent entrypoint
+scripts/                 replay-delivery, dry-run-task, gc-agent-artifacts
 tests/  fixtures/        node --test suite and GitHub payload fixtures
 ```
+
+Orchestrator state that is not in the queue — the `cursor-agent` chat id and Neon branch id per
+issue — lives in `~/.tmt-agent/state.json`, written by atomic rename. It is a cache: losing it
+costs a fresh chat and a new database branch, not correctness.
 
 Requires SQLite 3.45+ for `jsonb()`; `src/db.mjs` asserts this at boot rather than failing
 later with `no such function: jsonb`.

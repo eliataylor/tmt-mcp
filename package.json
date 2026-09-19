@@ -11,7 +11,11 @@
     "start": "node src/server.mjs",
     "dev": "node --watch src/server.mjs",
     "test": "node --test tests/",
-    "replay": "node scripts/replay-delivery.mjs"
+    "replay": "node scripts/replay-delivery.mjs",
+    "orchestrator": "node orchestrator/index.mjs",
+    "orchestrator:dry-run": "node scripts/dry-run-task.mjs",
+    "runner:build": "docker build -f docker/agent-runner.Dockerfile -t tmt-agent-runner .",
+    "gc": "node scripts/gc-agent-artifacts.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",

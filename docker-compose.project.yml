@@ -5,12 +5,13 @@
 # concurrency happens at the agent-runner layer, not here.
 #
 # Usage:
-#   cp .env .env.main-app       # then set PROJECT_SLUG / HOST_PORT / DATA_DIR in it
+#   cp .env .env.main-app       # then set PROJECT_SLUG / CONTROL_HOST_PORT / DATA_DIR in it
 #   docker compose -p main-app --env-file .env.main-app \
 #     -f docker-compose.dev.yml -f docker-compose.project.yml up -d
 #
-# Each stack needs a distinct HOST_PORT and DATA_DIR, and brings up its own cloudflared
+# Each stack needs a distinct CONTROL_HOST_PORT and DATA_DIR, and brings up its own cloudflared
 # quick tunnel — so every project gets its own random hostname that changes on restart.
+# CONTROL_HOST_PORT is the only published port; the webhook listener is never published.
 
 services:
   webhook-server:

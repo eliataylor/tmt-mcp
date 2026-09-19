@@ -21,6 +21,15 @@ describe('issues events', () => {
     assert.equal(classify({ event: 'issues', payload, project: PROJECT }).kind, 'ignore');
   });
 
+  test('the execute label enqueues execute mode', () => {
+    const payload = labeled();
+    payload.label = { name: 'agent:execute' };
+    assert.deepEqual(classify({ event: 'issues', payload, project: PROJECT }), {
+      kind: 'enqueue',
+      action: ACTIONS.EXECUTE,
+    });
+  });
+
   test('assignment to the agent login enqueues', () => {
     const payload = labeled();
     payload.action = 'assigned';
@@ -84,11 +93,34 @@ describe('issue_comment events', () => {
     assert.equal(classify({ event: 'issue_comment', payload, project: PROJECT }).action, ACTIONS.COMMENT);
   });
 
+  test('a comment on an issue with execute label runs in execute mode', () => {
+    const payload = commented();
+    payload.issue.labels = [{ name: 'agent:assigned' }, { name: 'agent:execute' }];
+    payload.comment.body = 'go ahead with the plan';
+    assert.equal(classify({ event: 'issue_comment', payload, project: PROJECT }).action, ACTIONS.EXECUTE);
+  });
+
   test('an unrelated comment on an unlabeled issue is ignored', () => {
     const payload = commented();
     payload.comment.body = 'thanks for the report';
     payload.issue.labels = [{ name: 'bug' }];
     assert.equal(classify({ event: 'issue_comment', payload, project: PROJECT }).kind, 'ignore');
+  });
+
+  test("the agent's own comment never re-triggers it", () => {
+    const byLogin = commented();
+    byLogin.comment.user = { login: 'Dev-Agent', id: 99120034, type: 'User' };
+    assert.equal(classify({ event: 'issue_comment', payload: byLogin, project: PROJECT }).kind, 'ignore');
+
+    const byBot = commented();
+    byBot.comment.user = { login: 'some-app[bot]', id: 99120035, type: 'Bot' };
+    assert.equal(classify({ event: 'issue_comment', payload: byBot, project: PROJECT }).kind, 'ignore');
+  });
+
+  test('without an agent_login, user comments are left alone', () => {
+    const payload = commented();
+    const project = { ...PROJECT, agent_login: null };
+    assert.equal(classify({ event: 'issue_comment', payload, project }).action, ACTIONS.COMMENT);
   });
 
   test('edits and deletions are ignored', () => {

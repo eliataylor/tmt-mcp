@@ -18,10 +18,14 @@ COPY db ./db
 RUN mkdir -p /app/data && chown -R node:node /app
 USER node
 
-EXPOSE 3000
+# 3000 is the webhook listener, reached only by cloudflared over agent-net and never published to
+# the host. 3001 is the control listener, published to 127.0.0.1 only.
+EXPOSE 3000 3001
 
+# /api/health lives on the control listener, so probe that port. Fetching 127.0.0.1 sets a Host
+# header the control guard's allowlist accepts, and no Origin or Sec-Fetch-* headers are sent.
 # No curl in the slim image, so probe with node itself.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.CONTROL_PORT||3001)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 CMD ["node", "src/server.mjs"]
