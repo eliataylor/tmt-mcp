@@ -29,10 +29,15 @@
         "setup_cmd": "npm ci"
       },
 
-      "//env_template": "Merged into .env.local in the clone, under the DATABASE_URL and GITHUB_ISSUE_NUMBER the orchestrator adds. Never put a real secret here; this file is committed.",
+      "//env_template": "Merged into .env.local on execute tasks only, with DATABASE_URL and GITHUB_ISSUE_NUMBER the orchestrator adds. Never put a real secret here; avoid host localhost URLs.",
       "env_template": {
-        "NEXT_PUBLIC_ENVIRONMENT": "development",
-        "NEXT_PUBLIC_API_URL": "http://localhost:3000"
+        "NEXT_PUBLIC_ENVIRONMENT": "development"
+      },
+
+      "//posthog": "Optional. Requires POSTHOG_MCP_API_KEY in .env.orchestrator. Pins the runner to this PostHog project (read-only unless read_only is false).",
+      "posthog": {
+        "project_id": "your-posthog-project-id",
+        "read_only": true
       }
     },
 

@@ -13,7 +13,14 @@ import { readFileSync } from 'node:fs';
 import { buildContext } from '../src/context.mjs';
 import { ACTIONS, classify } from '../src/triggers.mjs';
 import { loadRegistry } from '../src/projects.mjs';
-import { branchNameFor, clonePathFor, mirrorPathFor, resolveBranchPlan } from '../orchestrator/repo.mjs';
+import {
+  branchNameFor,
+  clonePathFor,
+  mirrorPathFor,
+  resolveBranchPlan,
+  resolvePlanRelativePath,
+} from '../orchestrator/repo.mjs';
+import { isPlanAction } from '../orchestrator/plan.mjs';
 import { buildCreateBranchBody, branchNameFor as neonBranchNameFor } from '../orchestrator/neon.mjs';
 import { buildPrompt } from '../orchestrator/prompt.mjs';
 import {
@@ -116,6 +123,8 @@ console.log(`thread        : ${context.fetch.comment_count} comment(s), ${contex
 
 // Triage reads the tree and writes labels, so every code-bearing stage below is skipped for it.
 const triage = verdict.action === ACTIONS.TRIAGE;
+const planning = isPlanAction(verdict.action);
+const planPath = triage ? null : resolvePlanRelativePath(project, issueNumber);
 
 heading('3. Git isolation');
 const mirror = mirrorPathFor(config.paths.mirrors, slug);
@@ -148,13 +157,15 @@ if (triage) {
   console.log('No start commit, no branch push, and no pull request for a triage task.');
   console.log(`The runner labels issue #${issueNumber} and comments on it over the GitHub MCP server.`);
 } else if (!plan.resume) {
-  console.log(`  git commit --allow-empty -m "chore(#${issueNumber}): start agent work"`);
+  console.log(`  write ${planPath} from templates/plan.scaffold.md`);
+  console.log(`  git add -- ${planPath} && git commit -m "chore(#${issueNumber}): add plan scaffold"`);
   console.log(`  git push --set-upstream origin ${plan.branch}`);
   console.log(`  POST /repos/${owner}/${repoName}/pulls  { head: "${plan.branch}", base: "${project.default_branch}", draft: true }`);
   console.log('        (falls back to draft:false if the repo/plan rejects draft PRs)');
   console.log(`  POST /repos/${owner}/${repoName}/issues/${issueNumber}/comments`);
 } else {
   console.log(`  GET  /repos/${owner}/${repoName}/pulls?head=${owner}:${plan.branch}&state=open   (reuse)`);
+  if (planning) console.log(`  write ${planPath} from the scaffold if the branch predates plan files`);
 }
 
 heading('5. Neon');
@@ -180,7 +191,7 @@ console.log(`${taskDir}/`);
 console.log('  task.json      the full context manifest');
 console.log('  prompt.md      rendered below');
 console.log('  out/           result.json and run.log come back here');
-console.log('  secrets.env    0600, GITHUB_TOKEN + CURSOR_API_KEY only');
+console.log('  secrets.env    0600, GITHUB_TOKEN + CURSOR_API_KEY (+ PostHog when POSTHOG_MCP_API_KEY is set)');
 console.log(
   triage
     ? '\n  no .env.local: a triage task gets no database URL because it runs nothing'
@@ -228,6 +239,11 @@ console.log(`\nsanitized label: ${label}`);
 heading('9. Loop closure');
 console.log(`docker wait ${containerName}`);
 console.log(`read ${taskDir}/out/result.json   (size-capped, shape-validated, control chars stripped)`);
+if (planning) {
+  console.log(`on exit 0: revert edits outside ${planPath}, stage only the plan file,`);
+  console.log(`  git commit -m "plan(#${issueNumber}): revision N (task ${taskId})" && git push origin ${plan.branch}`);
+  console.log(`  POST /repos/${project.repo}/issues/${issueNumber}/comments   (permalink + compare link, or "plan unchanged")`);
+}
 console.log('POST /api/agent/tasks/<id>/complete   on exit 0');
 console.log('POST /api/agent/tasks/<id>/fail      otherwise, with the log tail');
 console.log(`heartbeat every ${config.task.heartbeatSeconds}s; a 409 means the task was cancelled -> docker stop`);
@@ -241,6 +257,17 @@ if (config.preview.enabled && verdict.action === ACTIONS.EXECUTE) {
 }
 
 heading('10. prompt.md');
+// The real prompt describes the branch Neon reports back, which can differ from what was asked
+// for. A dry run has no branch to ask about, so it previews the request instead.
+const neonPreview =
+  triage || !project.neon
+    ? null
+    : {
+        name: neonBranchNameFor(issueNumber),
+        parentBranch: project.neon.parent_branch,
+        createdAt: new Date().toISOString(),
+        initSource: project.neon.init_source || 'parent-data',
+      };
 console.log(
   buildPrompt({
     context,
@@ -249,6 +276,9 @@ console.log(
     prUrl: args.resume && !triage ? `https://github.com/${project.repo}/pull/101` : null,
     action: verdict.action,
     taskId,
+    neon: neonPreview,
+    planPath,
+    planExists: !triage,
   })
 );
 

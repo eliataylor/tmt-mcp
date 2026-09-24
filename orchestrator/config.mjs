@@ -13,7 +13,13 @@ import { loadRegistry } from '../src/projects.mjs';
  * lives here on the host and is handed to a runner one task at a time.
  */
 
-const SECRET_NAMES = ['AGENT_POLL_SECRET', 'GITHUB_TOKEN', 'CURSOR_API_KEY', 'NEON_API_KEY'];
+const SECRET_NAMES = [
+  'AGENT_POLL_SECRET',
+  'GITHUB_TOKEN',
+  'CURSOR_API_KEY',
+  'NEON_API_KEY',
+  'POSTHOG_MCP_API_KEY',
+];
 
 /** Minimal dotenv reader. Existing environment always wins, so a shell export overrides the file. */
 function loadEnvFile(path) {
@@ -111,6 +117,7 @@ function mergeProject(registryEntry, orchestratorEntry = {}, defaults = {}) {
     ...registryEntry,
     local_path: orchestratorEntry.local_path || null,
     neon: orchestratorEntry.neon || null,
+    posthog: orchestratorEntry.posthog || null,
     env_template: { ...(defaults.env_template || {}), ...(orchestratorEntry.env_template || {}) },
     agent: {
       model: agent.model || null,

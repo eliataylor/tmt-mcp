@@ -89,6 +89,20 @@ describe('shared instance', () => {
     assert.equal((await res.json()).duplicate, true);
   });
 
+  test('control ingest queues without HMAC', async () => {
+    const payload = JSON.parse(fixtureBuffer('issues.labeled.json').toString('utf8'));
+    payload.label.name = 'agent:execute';
+    const res = await fetch(`${srv.base}/api/agent/ingest`, {
+      method: 'POST',
+      headers: srv.auth,
+      body: JSON.stringify({ event: 'issues', payload, delivery_id: 'ingest-execute-1' }),
+    });
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.equal(body.action, 'agent:execute');
+    assert.equal(body.duplicate, false);
+  });
+
   test('the per-project secret is required, not the global one', async () => {
     const res = await srv.deliver('issues.labeled.json', { delivery: 'd-global', secret: GLOBAL_SECRET });
     assert.equal(res.status, 401);
@@ -180,6 +194,7 @@ describe('shared instance', () => {
       ['POST', '/api/agent/tasks/whatever/fail'],
       ['POST', '/api/agent/tasks/whatever/heartbeat'],
       ['GET', '/api/agent/tasks'],
+      ['POST', '/api/agent/ingest'],
     ];
     for (const [method, path] of routes) {
       const res = await fetch(`${srv.base}${path}`, { method });

@@ -1,4 +1,5 @@
-import { rmSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 import { ACTIONS } from '../src/triggers.mjs';
 import { loadConfig } from './config.mjs';
@@ -8,6 +9,8 @@ import { createGithubClient } from './github.mjs';
 import { createNeonClient } from './neon.mjs';
 import { paneRunLogArgv, resolveHerdrSurface, workspaceLabelFor } from './herdr.mjs';
 import { buildPrompt } from './prompt.mjs';
+import { extractPlanSummary, isPlanAction, planBranchLink, renderPlanComment } from './plan.mjs';
+import { resolvePosthogRunnerEnv } from './posthog.mjs';
 import { awaitPreviews, renderPreviewComment } from './preview.mjs';
 import {
   buildRunArgs,
@@ -18,11 +21,18 @@ import {
   npmCacheVolumeFor,
 } from './runner.mjs';
 import {
+  assertPlanPathTracked,
+  commitPlanRevision,
   createStartCommit,
   ensureWorkdir,
+  planFileExists,
   prepareClone,
+  readHeadSha,
   readPushedSha,
+  renderPlanScaffold,
+  resolvePlanRelativePath,
   setCommitIdentity,
+  writePlanScaffold,
 } from './repo.mjs';
 import {
   createTaskDir,
@@ -147,6 +157,8 @@ async function handleTask(ctx, task) {
   // exists to support code: no task branch, no start commit, no PR, no database branch, no
   // .env.local. An issue that later gets planned or executed still gets all of that then.
   const triage = task.action === ACTIONS.TRIAGE;
+  const planning = isPlanAction(task.action);
+  const planPath = triage ? null : resolvePlanRelativePath(project, issueNumber);
 
   const paths = createTaskDir({
     tasksDir: config.paths.tasks,
@@ -185,20 +197,47 @@ async function handleTask(ctx, task) {
     const [owner, repoName] = project.repo.split('/');
     const gh = createGithubClient({ token: config.secrets.GITHUB_TOKEN, logger });
     let pr = null;
+    let headBefore = null;
+    let planExists = false;
 
     if (!triage) {
+      // The fallback address is deliberately undeliverable, but Vercel rejects a deployment whose
+      // commit author it cannot resolve to an account. Any project with preview deploys must set
+      // GIT_AUTHOR_EMAIL to a real address verified on the agent's GitHub account.
       await setCommitIdentity({
         clonePath,
         name: process.env.GIT_AUTHOR_NAME || 'tmt agent',
         email: process.env.GIT_AUTHOR_EMAIL || 'agent@tmt.local',
       });
 
-      // An empty commit is what makes a draft PR legal: GitHub rejects a PR with no commits between
-      // base and head, so pushing a branch identical to the default branch cannot open one.
-      if (!clone.resume) {
-        await createStartCommit({ clonePath, issueNumber, branch: clone.branch, logger });
-      }
+      const scaffold = renderPlanScaffold({
+        issue: issueNumber,
+        issue_title: context.issue.title,
+        issue_url: context.issue.url,
+        task_id: task.id,
+        created_at: new Date().toISOString(),
+      });
 
+      // The branch's first commit adds the plan scaffold, whichever mode started the work. It is
+      // also what makes a draft PR legal: GitHub rejects a PR with no commits between base and head.
+      if (!clone.resume) {
+        await createStartCommit({
+          clonePath,
+          issueNumber,
+          branch: clone.branch,
+          planPath,
+          scaffold,
+          logger,
+        });
+      } else if (planning && !planFileExists({ clonePath, planPath })) {
+        // A branch from before plan files existed. The scaffold lands with this run's revision.
+        writePlanScaffold({ clonePath, planPath, content: scaffold });
+        await assertPlanPathTracked(clonePath, planPath);
+      }
+      planExists = planFileExists({ clonePath, planPath });
+      headBefore = await readHeadSha(clonePath);
+
+      const planLink = planBranchLink({ owner, repo: repoName, branch: clone.branch, planPath });
       const ensured = await gh.ensurePullRequest({
         owner,
         repo: repoName,
@@ -207,6 +246,7 @@ async function handleTask(ctx, task) {
         title: `${context.issue.title} (#${issueNumber})`,
         body:
           `Automated work for #${issueNumber}.\n\n` +
+          `Plan: [\`${planPath}\`](${planLink}) — every plan run is its own commit, linked from the issue.\n\n` +
           `Branch \`${clone.branch}\`, driven by the local agent orchestrator.\n` +
           'Closing this PR also releases the ephemeral database branch.',
       });
@@ -221,7 +261,7 @@ async function handleTask(ctx, task) {
           issueNumber,
           body:
             `Picked this up locally. Working on \`${clone.branch}\`, tracking in #${prNumber}.\n\n` +
-            'I will comment again with my understanding before making changes.',
+            `The plan lives in [\`${planPath}\`](${planLink}). I will link each revision here.`,
         });
       }
 
@@ -255,14 +295,18 @@ async function handleTask(ctx, task) {
         prUrl: pr?.html_url || null,
         action: task.action,
         taskId: task.id,
+        neon: neonInfo,
+        planPath,
+        planExists,
       })
     );
 
-    // Only the two credentials the runner genuinely needs. writeSecrets hard-fails on anything
-    // from the forbidden list, so the Neon key and the queue token cannot leak in here.
+    // Runner credentials only. writeSecrets hard-fails on anything from the forbidden list, so the
+    // Neon key and the queue token cannot leak in here. PostHog is optional (see posthog.mjs).
     writeSecrets(paths, {
       GITHUB_TOKEN: config.secrets.GITHUB_TOKEN,
       CURSOR_API_KEY: config.secrets.CURSOR_API_KEY,
+      ...resolvePosthogRunnerEnv({ project, secrets: config.secrets }),
     });
 
     const runArgs = buildRunArgs({
@@ -326,7 +370,31 @@ async function handleTask(ctx, task) {
       last_exit_code: result.valid ? result.exitCode : exitCode,
     });
 
-    if (succeeded) {
+    let planFailure = null;
+    if (succeeded && planning) {
+      try {
+        await publishPlanRevision({
+          gh,
+          owner,
+          repo: repoName,
+          issueNumber,
+          clonePath,
+          planPath,
+          branch: clone.branch,
+          headBefore,
+          taskId: task.id,
+          label,
+        });
+      } catch (err) {
+        planFailure = `plan revision could not be published: ${err.message}`;
+        logger.error(`[Task] ${label} ${planFailure}`);
+        succeeded = false;
+      }
+    }
+
+    if (planFailure) {
+      await queue.fail(task.id, sanitizeText(planFailure, 2000));
+    } else if (succeeded) {
       // Before completing, so the lease and its heartbeat still cover the wait on the build.
       await commentPreviewUrl(ctx, {
         gh,
@@ -378,11 +446,56 @@ async function handleTask(ctx, task) {
 }
 
 /**
+ * Commit the agent's plan edit as its own revision and link it from the issue.
+ *
+ * The orchestrator does this rather than the agent so that every plan run is guaranteed to leave
+ * exactly one commit touching only the plan file, and a comment that points at that exact version.
+ */
+async function publishPlanRevision({
+  gh,
+  owner,
+  repo,
+  issueNumber,
+  clonePath,
+  planPath,
+  branch,
+  headBefore,
+  taskId,
+  label,
+}) {
+  const revision = await commitPlanRevision({
+    clonePath,
+    planPath,
+    issueNumber,
+    taskId,
+    branch,
+    headBefore,
+    logger,
+  });
+
+  let summary = null;
+  try {
+    summary = extractPlanSummary(readFileSync(join(clonePath, planPath), 'utf8'));
+  } catch {
+    // A missing plan file just means there is no summary line to quote.
+  }
+
+  const body = renderPlanComment({ owner, repo, planPath, summary, ...revision });
+  if (!body) {
+    throw new Error(`${planPath} has never been committed and the agent did not write it`);
+  }
+  await gh.commentOnIssue({ owner, repo, issueNumber, body });
+  logger.log(
+    `[Task] ${label} ${revision.changed ? `linked plan revision ${revision.revision}` : 'plan unchanged; commented'}`
+  );
+}
+
+/**
  * Comment the preview URL for whatever the agent just pushed.
  *
- * Execute tasks only: a plan task pushes nothing, so the only deployment on the branch would be the
- * one from the empty start commit, which shows a preview of the base branch and tells nobody
- * anything. Silent when the repo has no hosting integration reporting deployments to GitHub.
+ * Execute tasks only: a plan task pushes nothing but the plan file, so its deployment is a preview of
+ * the base branch and tells nobody anything. Silent when the repo has no hosting integration
+ * reporting deployments to GitHub.
  */
 async function commentPreviewUrl(ctx, { gh, owner, repo, issueNumber, branch, clonePath, action, label }) {
   const { preview } = ctx.config;

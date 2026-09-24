@@ -7,7 +7,8 @@
  *   { kind: 'ignore', reason }   - acknowledge with 200 so GitHub does not retry
  *
  * Plan vs execute vs triage:
- *   trigger_label (default agent:assigned) — context + issue comment with plan/questions; no code.
+ *   trigger_label (default agent:assigned) — plan/questions committed to the plan file on the task
+ *     branch, linked from a short issue comment; no code.
  *   execute_label (default agent:execute) — implement on the task branch.
  *   triage_label (default agent:triage) — label the issue and cross-link related ones; no code.
  */
@@ -47,8 +48,9 @@ function ignore(reason) {
 /**
  * The agent's own comments and label changes must never re-trigger it.
  *
- * Plan mode's deliverable is an issue comment, and the issue still carries its trigger label when
- * that comment lands — so without this the agent answers itself until a human removes the label.
+ * Every plan run ends in an issue comment linking the new plan revision, and the issue still carries
+ * its trigger label when that comment lands — so without this the agent answers itself until a
+ * human removes the label.
  * Triage mode's deliverable is a set of labels, which arrive back as `issues.labeled` deliveries.
  * A GitHub App is recognised by type; a machine user needs `agent_login` to match the token the
  * orchestrator posts with. Leave `agent_login` unset only when the agent posts as a Bot.

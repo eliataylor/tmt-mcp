@@ -2,7 +2,8 @@
 #   docker build -f docker/agent-runner.Dockerfile -t tmt-agent-runner .
 #
 # The container receives a per-task clone at /workspace, its prompt at /task, a writable /out for
-# its result, and exactly two credentials through a mounted file. It has no route to the queue and
+# its result, and credentials through a mounted file (GitHub + Cursor; optional PostHog MCP key).
+# It has no route to the queue and
 # no Docker or Herdr socket. See orchestrator/runner.mjs for the mount allowlist.
 FROM node:22-bookworm-slim
 

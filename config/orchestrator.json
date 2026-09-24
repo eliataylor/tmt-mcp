@@ -14,7 +14,7 @@
     "matchbear": {
       "//": "Slug must match projects.json. local_path seeds the mirror without network auth when present.",
       "local_path": "/Users/trackauthoritymusic/Developer/matchbear/Demo",
-      "clone_url": "git@github.com:eliataylor/nextjs.git",
+      "clone_url": "git@github.com:eliataylor/matchbear.git",
 
       "neon": {
         "//": "Omit this whole block for projects that need no database branch.",
@@ -29,10 +29,9 @@
         "setup_cmd": "npm ci"
       },
 
-      "//env_template": "Merged into .env.local in the clone, under the DATABASE_URL and GITHUB_ISSUE_NUMBER the orchestrator adds. Never put a real secret here; this file is committed.",
+      "//env_template": "Merged into .env.local on execute tasks only, with DATABASE_URL and GITHUB_ISSUE_NUMBER the orchestrator adds. No host localhost URLs — previews come from Vercel via GitHub Deployments after push.",
       "env_template": {
-        "NEXT_PUBLIC_ENVIRONMENT": "development",
-        "NEXT_PUBLIC_API_URL": "http://localhost:3000"
+        "NEXT_PUBLIC_ENVIRONMENT": "development"
       }
     },
 

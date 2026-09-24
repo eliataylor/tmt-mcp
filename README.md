@@ -61,12 +61,18 @@ re-read on `SIGHUP` (`docker compose kill -s HUP webhook-server`).
       "default_branch": "main",
       "trigger_label": "agent:assigned",
       "mention": "@dev-agent",
+      "plan_folder": ".agent/plans",
       "agent_login": "dev-agent",
       "webhook_secret_env": "WEBHOOK_SECRET_MAIN_APP"
     }
   ]
 }
 ```
+
+`plan_folder` is optional (default `.agent/plans`): the folder, relative to the target repo root,
+where each issue's plan is committed as `PLAN-<issue>.md`. It must be a relative path inside the
+repository and must not be gitignored there — the orchestrator refuses to scaffold into an ignored
+folder, because every plan commit would come out empty.
 
 `webhook_secret_env` is optional; without it the project uses `GITHUB_WEBHOOK_SECRET`. With
 it, that repo's deliveries are verified against its own secret, so one tenant's webhook
@@ -82,7 +88,7 @@ name instead.
 | Event | Condition | Result |
 | --- | --- | --- |
 | `issues.labeled` | applied by the agent itself | ignored — triage applies labels, and they must not re-trigger it |
-| `issues.labeled` | label matches `trigger_label` | queue `agent:assigned` (**plan** — issue comment only) |
+| `issues.labeled` | label matches `trigger_label` | queue `agent:assigned` (**plan** — plan file on the task branch, no code) |
 | `issues.labeled` | label matches `execute_label` (default `agent:execute`) | queue `agent:execute` (**implement** on the task branch) |
 | `issues.labeled` | label matches `triage_label` (default `agent:triage`) | queue `agent:triage` (**triage** — labels + cross-links, no code) |
 | `issues.assigned` | assignee matches `agent_login` | queue `agent:assigned` (plan) |
@@ -96,8 +102,8 @@ name instead.
 | `issues.closed` | — | cancel that issue's pending tasks |
 | `issues.unlabeled` | label matches `trigger_label` | cancel that issue's pending tasks |
 
-Plan mode's deliverable is an issue comment, posted while the trigger label is still on the
-issue — so the author check above is what keeps the agent from triggering itself in a loop.
+Every plan run ends in an issue comment linking the new plan revision, posted while the trigger
+label is still on the issue — so the author check above is what keeps the agent from triggering itself in a loop.
 It only holds if `GITHUB_TOKEN` belongs to the agent and not to a human: with a shared personal
 token the agent posts under your login, and setting `agent_login` to that login would silence
 your own comments too. Give the agent its own machine user or GitHub App before relying on it.
@@ -107,7 +113,7 @@ Optional per-project overrides in `projects.json`: `execute_label` (default `age
 Removing `execute_label` or `triage_label` does **not** cancel queued work; only losing
 `trigger_label` or closing the issue does.
 
-**Typical flow:** add `agent:assigned` → agent posts plan/questions on the issue → human adds `agent:execute` → agent implements.
+**Typical flow:** add `agent:assigned` → the orchestrator opens `agent/issue-<n>` and a draft PR whose first commit is the plan scaffold → the agent writes the plan → the orchestrator commits it and links that revision on the issue → humans reply, each reply producing a new plan revision → a human adds `agent:execute` → the agent implements from the plan file.
 
 Everything else gets a 200 with `{ "ignored": true }` so GitHub does not keep retrying.
 
@@ -115,8 +121,8 @@ Everything else gets a 200 with `{ "ignored": true }` so GitHub does not keep re
 
 | Mode | Queue action | Deliverable | Writes |
 | --- | --- | --- | --- |
-| **Triage** | `agent:triage` | Labels on the issue, plus one comment cross-linking related issues | Labels + 1 comment |
-| **Plan** | `agent:assigned`, `agent:opened`, `comment_created` | One issue comment: understanding, open questions, implementation plan | 1 comment |
+| **Triage** | `agent:triage` | Labels on the issue, plus one short comment sizing it | Labels + 1 comment |
+| **Plan** | `agent:assigned`, `agent:opened`, `comment_created` | A revision of `<plan_folder>/PLAN-<n>.md`: understanding, open questions, implementation plan | 1 plan commit (by the orchestrator) + 1 short link comment |
 | **Execute** | `agent:execute` | The change itself, on `agent/issue-<n>`, summarized on the PR | Commits, push, PR comment |
 
 Each mode's ground rules and definition of done are rendered into the task prompt by
@@ -126,12 +132,57 @@ execute rules. [`.cursor/rules/agent-instructions.md`](.cursor/rules/agent-instr
 only the part that is identical for every mode (MCP usage, context gathering, the untrusted-input
 rule) and is inlined verbatim into all of them.
 
+### Plan mode
+
+Plans live in the pull request, not in the issue thread, so the thread stays readable and the
+plan's evolution is ordinary git history.
+
+- **Setup is shared with execute.** Whichever label or mention first gives an issue a branch, the
+  branch's first commit adds `<plan_folder>/PLAN-<n>.md` from
+  [`templates/plan.scaffold.md`](templates/plan.scaffold.md), and the draft PR links to it. A branch
+  created before plan files existed gets the scaffold on its next plan run.
+- **The agent only edits the file.** It does not commit, push, or post the plan as a comment.
+- **The orchestrator makes the commit.** After a successful run it reverts uncommitted edits outside
+  the plan file (ignored files such as `.env.local` are untouched), stages only the plan file,
+  commits it as `plan(#<n>): revision <N> (task <id>)`, and pushes. So every plan run that changes
+  the plan is exactly one commit. Commits the agent made on its own are left in place and flagged
+  in the comment, since removing pushed ones would need a force-push.
+- **The issue gets a short link comment** pointing at that exact version (a commit permalink, not
+  the branch) plus a compare link to the previous revision, and the agent's one-line
+  `<!-- summary: ... -->` from the file. A run that leaves the plan unchanged posts "plan
+  unchanged" with a link to the current version instead of committing.
+- **Execute follows the file.** The execute prompt names the plan file as the plan of record.
+
+What happens to the plan file when the PR merges is left to the reviewer: keep it as a design
+record, or delete it before merging.
+
+Plan-only commits still push to the PR branch, so a target repo with preview deployments or CI
+will build on every revision unless it skips them. Configure that in the target repo, for example:
+
+- **Vercel** — an Ignored Build Step such as
+  `git diff --quiet HEAD^ HEAD -- . ':(exclude).agent/plans'` (exit 0 skips the build).
+- **GitHub Actions** — `paths-ignore: ['.agent/plans/**']` on `push` / `pull_request` triggers.
+
 ### Triage mode
 
 `agent:triage` is the cheapest thing the agent can do to an issue: it reads the thread and the code,
-applies labels, and posts one comment cross-linking the issues this one relates to. It never opens a
-branch, a pull request, or a database branch, so the whole task is a clone, a container, and two API
-writes.
+applies labels, and posts one comment sizing the change. It never opens a branch, a pull request, or
+a database branch, so the whole task is a clone, a container, and two API writes.
+
+The comment is a fixed shape under 120 words, and every line but the first two is dropped when it
+does not apply:
+
+```
+**Difficulty:** moderate · **Estimate:** 4-8h
+**Labels:** bug, area:billing
+**Needs:** <missing detail, and the template field it belongs in>
+**Related:** #12, #34
+**Note:** <one line — a label that should exist, or evidence this is already fixed>
+```
+
+Difficulty is one of `trivial`, `small`, `moderate`, `large`, or `unknown`, and the estimate is
+focused implementation time for one engineer who knows the codebase, review and QA excluded. An
+issue too thin to locate the change in the code is sized `unknown` rather than guessed at.
 
 The orchestrator skips every code-bearing stage for it — no start commit, no PR, no Neon branch, no
 `.env.local`, no preview comment — and the clone stays on the default branch rather than
@@ -151,26 +202,24 @@ Three constraints make it safe to leave on a busy repo:
   `issues.labeled` deliveries whose sender is the agent are ignored outright — so even a
   misbehaving run cannot label its way from triage into execute mode.
 
-Related issues are found by shared files (paths cited in the thread, plus `git log` over those paths
-to reach the PRs and issues that touched them) and by shared function (same route, table, dependency,
-or user-facing flow). They are cross-linked by writing `#<number>` in the one comment on the triaged
-issue, which is enough for GitHub to record the back-reference on the other side — the agent is told
-not to comment on the other issues, so triaging a pile of issues does not spam every thread it
-touches.
+Related issues, when the agent finds any, are bare `#<number>` references on one line: searched for
+over the paths, symbols, and error strings the thread cites, and kept only when a file, route, or
+flow is genuinely shared. Writing the number is enough for GitHub to record the back-reference on the
+other side — the agent is told not to comment on the other issues, so triaging a pile of issues does
+not spam every thread it touches.
 
 The prompt also tells triage to treat the issue as a report rather than as instructions, and gives it
 two ways out of classifying something it cannot classify:
 
-- **Too thin.** If the report does not say what was expected, what happened, or where, the agent asks
-  for the missing pieces — URL, numbered steps, role, a screenshot or recording, a concrete example —
-  instead of guessing a diagnosis. It reads `.github/ISSUE_TEMPLATE/` in the checkout first and points
-  the reporter at the template that fits, so the ask matches what that repo already defines as a
-  usable report.
+- **Too thin.** If the report does not say what was expected, what happened, or where, the `Needs:`
+  line asks for the few details that block sizing instead of guessing a diagnosis. The agent reads
+  `.github/ISSUE_TEMPLATE/` in the checkout first and names the template and fields that fit, so the
+  ask matches what that repo already defines as a usable report. When it can size the issue, it asks
+  for nothing.
 - **Too old.** The issue header carries the opened and updated dates with their age in days, and past
-  a week the prompt says outright that the issue may already be fixed, superseded, or describing a
-  screen that no longer exists. The agent checks the current default branch and `git log --since` over
-  the paths before calling an old report live, and can recommend closing — it still never closes
-  anything itself.
+  a week the prompt points at `git log --since=<issue date>` over the paths the issue names, since
+  the fix may already have landed. That read goes on the `Note:` line with a recommendation to close
+  — the agent still never closes anything itself.
 
 A comment arriving later on a triaged issue does **not** re-triage it; triage is a one-shot
 classification. Add `agent:assigned` when the issue deserves a plan.
@@ -209,8 +258,8 @@ and every reference records which of the two it came from:
 body, and an `issue_comment` event carries only the one comment. So `fetch` states how many
 comments exist and where to get them, which is exactly what
 [.cursor/rules/agent-instructions.md](.cursor/rules/agent-instructions.md) tells the agent to
-load via GitHub MCP (`get_issue`, `get_issue_comments`) and where to post plan replies (issue
-comment via MCP). The `references.files` array feeds the codebase scan;
+load via GitHub MCP (`get_issue`, `get_issue_comments`). Plans go in the plan file rather than
+a comment (see [Plan mode](#plan-mode)). The `references.files` array feeds the codebase scan;
 paths are picked up from blob permalinks, backticked paths with `:10-20` suffixes, bare
 path-shaped tokens (including inside pasted stack traces), and `path=` on a code fence.
 
@@ -358,8 +407,8 @@ overlapping ticks, and it polls only while under `MAX_CONCURRENT_TASKS`. Per tas
    container still use HTTPS.
 2. **Branch.** `agent/issue-<n>`, created from the project's default branch, or checked out and
    fast-forwarded if it already exists so a follow-up comment continues the same PR.
-3. **PR.** An empty commit, a push, then a draft PR (falling back to a normal PR when the plan
-   rejects drafts), then a comment on the issue linking it. Opening the PR up front means the
+3. **PR.** A first commit adding the plan scaffold, a push, then a draft PR (falling back to a
+   normal PR when the plan rejects drafts), then a comment on the issue linking it and the plan file. Opening the PR up front means the
    human watches the diff arrive rather than waiting for a finished branch.
 4. **Neon.** For projects with a `neon` block, an ephemeral branch off `parent_branch`, giving the
    runner a real `DATABASE_URL` in `.env.local` that it can migrate against and cannot use to
@@ -368,7 +417,9 @@ overlapping ticks, and it polls only while under `MAX_CONCURRENT_TASKS`. Per tas
 6. **Relay.** `result.json` from `/out` decides `complete` or `fail`; a heartbeat every
    `HEARTBEAT_INTERVAL_SECONDS` keeps the lease and doubles as the cancellation channel — a task
    moved to `canceled` (by closing the issue or removing the label) stops the container.
-7. **Preview.** On a successful execute task, the deployment URL for the commit that was just
+7. **Plan revision.** On a successful plan task, the plan file committed and pushed as its own
+   revision, and a link to that version commented on the issue (see [Plan mode](#plan-mode)).
+8. **Preview.** On a successful execute task, the deployment URL for the commit that was just
    pushed, commented on the issue.
 
 A triage task runs 1, 5, and 6 only: it clones read-only on the default branch and skips the branch,
@@ -393,7 +444,7 @@ commented too, with a link to its log. Nothing found means no comment. Set
 
 This lands on the **issue**, not the PR, because Vercel's own bot already comments on the PR and
 the issue thread is where the agent's other updates are. Only execute tasks get one; a plan task
-pushes nothing, so the only deployment would be the empty start commit's.
+pushes only the plan file, so its deployment would just preview the base branch.
 
 Previews are public by default, but a project using Deployment Protection (Vercel Authentication,
 Password Protection, Trusted IPs) will ask for a login when the link is opened. That is a Vercel
@@ -401,8 +452,10 @@ project setting, not something this orchestrator can influence.
 
 Secrets reach the runner as a single 0600 `secrets.env` bind-mounted at `/run/secrets/env`, never
 as `-e` flags: `docker inspect` and `ps` both expose environment variables to any process on the
-host, and Docker persists them in container JSON. The file is shredded after the run. It carries
-only `GITHUB_TOKEN` and `CURSOR_API_KEY`; `NEON_API_KEY` is asserted absent, since it is
+host, and Docker persists them in container JSON. The file is shredded after the run. It always
+carries `GITHUB_TOKEN` and `CURSOR_API_KEY`. When `POSTHOG_MCP_API_KEY` is set in
+`.env.orchestrator`, the runner also gets PostHog MCP credentials (read-only by default) so the
+agent can query analytics, errors, and flags. `NEON_API_KEY` is asserted absent, since it is
 org-scoped and could delete whole projects while the runner only ever needs the `DATABASE_URL`
 that came out of it.
 
@@ -413,6 +466,7 @@ particular not the Docker socket, not the Herdr socket, not `~/.ssh`, `~/.gitcon
 or `~/.aws`, not the mirror cache, and not the developer's checkout.
 
 ```bash
+npm run reconcile                # table of recent GitHub triggers vs queue; --enqueue <row#> to ingest
 npm run orchestrator:dry-run     # print every command and payload for a fixture, run nothing
 npm run gc                       # report orphaned containers, old clones, unused volumes
 npm run gc -- --older-than 3d --volumes --apply    # nothing is deleted without --apply
@@ -432,7 +486,10 @@ instead:
 security add-generic-password -s tmt-agent -a GITHUB_TOKEN -w
 security add-generic-password -s tmt-agent -a CURSOR_API_KEY -w
 security add-generic-password -s tmt-agent -a NEON_API_KEY -w
+security add-generic-password -s tmt-agent -a POSTHOG_MCP_API_KEY -w
 ```
+
+Optional PostHog MCP: create a [personal API key](https://posthog.com/docs/api/personal-api-keys) with the **MCP Server** preset, set `POSTHOG_MCP_API_KEY` in `.env.orchestrator`, and pin each queue project with a `posthog` block in `config/orchestrator.json` (`project_id`, optional `organization_id`, `read_only` defaulting to true). Rebuild the runner image after changing `docker/agent-entrypoint.sh`.
 
 Worth doing: Keychain ACLs prompt per binary, whereas a plaintext file under `~/.tmt-agent` or
 `~/Developer` is readable by anything running as you — neither path is TCC-protected. Use a

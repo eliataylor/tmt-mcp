@@ -6,7 +6,31 @@ export const DEFAULTS = {
   execute_label: 'agent:execute',
   triage_label: 'agent:triage',
   mention: '@dev-agent',
+  plan_folder: '.agent/plans',
 };
+
+/**
+ * Plan files are committed into the target repository, so the folder has to stay inside it. The
+ * orchestrator writes to `<clone>/<plan_folder>` on the host, which makes an escaping path a write
+ * outside the clone rather than a cosmetic problem.
+ */
+export function normalizePlanFolder(value, where = 'plan_folder') {
+  if (value === undefined || value === null || value === '') return DEFAULTS.plan_folder;
+  if (typeof value !== 'string') throw new Error(`${where} must be a string`);
+  const trimmed = value.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  if (!trimmed || trimmed === '.') {
+    throw new Error(`${where} must name a folder inside the repository, got "${value}"`);
+  }
+  if (trimmed.startsWith('/') || /^[a-zA-Z]:/.test(trimmed)) {
+    throw new Error(`${where} must be relative to the repository root, got "${value}"`);
+  }
+  const segments = trimmed.split('/').filter((s) => s && s !== '.');
+  if (segments.includes('..')) {
+    throw new Error(`${where} must not contain "..", got "${value}"`);
+  }
+  if (segments[0] === '.git') throw new Error(`${where} must not be inside .git, got "${value}"`);
+  return segments.join('/');
+}
 
 function envFlag(name, fallback = false) {
   const raw = process.env[name];
@@ -37,6 +61,7 @@ function normalizeProject(raw, index) {
     execute_label: raw.execute_label || DEFAULTS.execute_label,
     triage_label: raw.triage_label || DEFAULTS.triage_label,
     mention: raw.mention || DEFAULTS.mention,
+    plan_folder: normalizePlanFolder(raw.plan_folder, `${where} (${raw.slug}) "plan_folder"`),
     agent_login: raw.agent_login || null,
     webhook_secret_env: raw.webhook_secret_env || null,
   };

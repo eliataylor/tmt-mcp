@@ -1,7 +1,11 @@
-import { existsSync, mkdirSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
+import { normalizePlanFolder } from '../src/projects.mjs';
 import { git, run } from './exec.mjs';
+
+const PLAN_SCAFFOLD_PATH = fileURLToPath(new URL('../templates/plan.scaffold.md', import.meta.url));
 
 /**
  * Git isolation.
@@ -195,15 +199,163 @@ export async function prepareClone({
   return { clonePath, mirror, defaultBranch: effectiveDefault, ...plan };
 }
 
+/** Where an issue's plan lives, relative to the repository root. */
+export function resolvePlanRelativePath(project, issueNumber) {
+  const n = Number(issueNumber);
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new Error(`issue number must be a positive integer, got "${issueNumber}"`);
+  }
+  return `${normalizePlanFolder(project?.plan_folder)}/PLAN-${n}.md`;
+}
+
+/**
+ * Fill the scaffold's `{placeholder}` tokens in one pass, so a value that itself contains a token
+ * (an issue title like "Support {issue} links") is written literally rather than substituted again.
+ */
+export function renderPlanScaffold(values, template = readFileSync(PLAN_SCAFFOLD_PATH, 'utf8')) {
+  return template.replace(/\{([a-z_]+)\}/g, (token, key) =>
+    Object.hasOwn(values, key) && values[key] !== null && values[key] !== undefined
+      ? String(values[key]).replace(/[\r\n]+/g, ' ')
+      : token
+  );
+}
+
+/** Writes the scaffold unless the file already exists. Returns whether it wrote anything. */
+export function writePlanScaffold({ clonePath, planPath, content }) {
+  const target = join(clonePath, planPath);
+  if (existsSync(target)) return false;
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(target, content);
+  return true;
+}
+
+export function planFileExists({ clonePath, planPath }) {
+  return existsSync(join(clonePath, planPath));
+}
+
+/** A gitignored plan folder would make every plan commit silently empty. */
+export async function assertPlanPathTracked(clonePath, planPath) {
+  if (await git(clonePath).succeeds(['check-ignore', '-q', '--', planPath])) {
+    throw new Error(
+      `${planPath} is covered by .gitignore in this repository, so plan revisions cannot be ` +
+        'committed. Point plan_folder at a tracked folder or un-ignore it.'
+    );
+  }
+}
+
 /**
  * GitHub rejects a pull request with no commits between base and head, so a branch identical to
- * the default branch cannot open one. An empty commit is what makes the draft PR legal.
+ * the default branch cannot open one. The branch's first commit adds the plan scaffold, which is
+ * what makes the draft PR legal. It falls back to an empty commit when the file already exists on
+ * the base branch, which happens when a reviewer kept an earlier plan in a merged PR.
  */
-export async function createStartCommit({ clonePath, issueNumber, branch, logger = console }) {
+export async function createStartCommit({
+  clonePath,
+  issueNumber,
+  branch,
+  planPath,
+  scaffold,
+  logger = console,
+}) {
   const g = git(clonePath);
-  await g.run(['commit', '--allow-empty', '-m', `chore(#${issueNumber}): start agent work`]);
+  const wrote = writePlanScaffold({ clonePath, planPath, content: scaffold });
+  if (wrote) {
+    await assertPlanPathTracked(clonePath, planPath);
+    await g.run(['add', '--', planPath]);
+    await g.run(['commit', '-m', `chore(#${issueNumber}): add plan scaffold`]);
+  } else {
+    await g.run(['commit', '--allow-empty', '-m', `chore(#${issueNumber}): start agent work`]);
+  }
   await g.run(['push', '--set-upstream', 'origin', branch]);
-  logger.log(`[Repo] pushed ${branch}`);
+  logger.log(`[Repo] pushed ${branch}${wrote ? ` with ${planPath}` : ''}`);
+}
+
+export async function readHeadSha(clonePath) {
+  return git(clonePath).capture(['rev-parse', 'HEAD']);
+}
+
+/** The last commit that touched the plan file, or null when it has never been committed. */
+export async function readPlanCommitSha({ clonePath, planPath }) {
+  const sha = await git(clonePath).capture(['log', '-1', '--format=%H', '--', planPath]);
+  return sha || null;
+}
+
+const REVISION_SUBJECT = /^plan\(#\d+\): revision \d+/;
+
+export function planRevisionMessage({ issueNumber, revision, taskId }) {
+  return `plan(#${issueNumber}): revision ${revision} (task ${String(taskId).slice(0, 8)})`;
+}
+
+/** Porcelain v1 paths, with a rename reported as its destination. */
+export function parsePorcelainPaths(output) {
+  return output
+    .split('\n')
+    .filter((line) => line.length > 3)
+    .map((line) => {
+      const path = line.slice(3);
+      const arrow = path.indexOf(' -> ');
+      const target = arrow === -1 ? path : path.slice(arrow + 4);
+      return target.replace(/^"(.*)"$/, '$1');
+    });
+}
+
+/**
+ * Commit whatever the agent wrote to the plan file, and nothing else.
+ *
+ * Uncommitted edits elsewhere are reverted: plan mode's only output is the plan. Commits the agent
+ * made on its own are left in place, because collapsing ones it already pushed would mean a
+ * force-push, and they are reported so a human can look at them. Ignored files (`.env.local`,
+ * `node_modules`) are never touched.
+ */
+export async function commitPlanRevision({
+  clonePath,
+  planPath,
+  issueNumber,
+  taskId,
+  branch,
+  headBefore,
+  logger = console,
+}) {
+  const g = git(clonePath);
+  const warnings = [];
+
+  const agentCommits = headBefore
+    ? Number(await g.capture(['rev-list', '--count', `${headBefore}..HEAD`]))
+    : 0;
+  if (agentCommits > 0) {
+    warnings.push(`the agent made ${agentCommits} commit(s) of its own; left in place`);
+  }
+
+  // Not capture(): trimming would eat the leading status column of the first line.
+  const { stdout: status } = await g.run(['status', '--porcelain=v1', '--untracked-files=all']);
+  const stray = parsePorcelainPaths(status).filter((p) => p !== planPath);
+
+  await g.run(['reset', '-q']);
+  if (planFileExists({ clonePath, planPath })) await g.run(['add', '--', planPath]);
+  if (stray.length) {
+    await g.run(['checkout', '--', '.']);
+    await g.run(['clean', '-fdq']);
+    warnings.push(`reverted edits outside the plan: ${stray.slice(0, 10).join(', ')}`);
+  }
+  for (const w of warnings) logger.warn(`[Repo] #${issueNumber}: ${w}`);
+
+  const prevSha = await readPlanCommitSha({ clonePath, planPath });
+
+  if (await g.succeeds(['diff', '--cached', '--quiet', '--', planPath])) {
+    return { changed: false, sha: prevSha, prevSha, revision: null, warnings };
+  }
+
+  const subjects = prevSha
+    ? (await g.capture(['log', '--format=%s', '--', planPath])).split('\n')
+    : [];
+  const revision = subjects.filter((s) => REVISION_SUBJECT.test(s)).length + 1;
+
+  await g.run(['commit', '-m', planRevisionMessage({ issueNumber, revision, taskId })]);
+  await g.run(['push', '--set-upstream', 'origin', branch]);
+  const sha = await readHeadSha(clonePath);
+  logger.log(`[Repo] #${issueNumber}: pushed plan revision ${revision} (${sha.slice(0, 7)})`);
+
+  return { changed: true, sha, prevSha, revision, warnings };
 }
 
 export async function pushBranch({ clonePath, branch }) {

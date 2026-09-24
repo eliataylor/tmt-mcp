@@ -134,9 +134,16 @@ export function createNeonClient({ apiKey, fetchImpl = fetch, logger = console }
 
       if (existing) {
         logger.log(`[Neon] reusing branch ${name}`);
-        await waitUntilReady(projectId, existing.id);
+        const ready = await waitUntilReady(projectId, existing.id);
         const uri = await connectionUriFor(projectId, existing.id);
-        return { branchId: existing.id, name, created: false, ...splitUris(uri) };
+        return {
+          branchId: existing.id,
+          name,
+          created: false,
+          parentBranch,
+          ...describeBranch(ready || existing),
+          ...splitUris(uri),
+        };
       }
 
       const parentId = await resolveParentId(projectId, parentBranch);
@@ -147,10 +154,17 @@ export function createNeonClient({ apiKey, fetchImpl = fetch, logger = console }
       const branchId = created.branch?.id;
       const direct = created.connection_uris?.[0]?.connection_uri || null;
 
-      await waitUntilReady(projectId, branchId);
+      const ready = await waitUntilReady(projectId, branchId);
       const uri = direct || (await connectionUriFor(projectId, branchId));
 
-      return { branchId, name, created: true, ...splitUris(uri) };
+      return {
+        branchId,
+        name,
+        created: true,
+        parentBranch,
+        ...describeBranch(ready || created.branch),
+        ...splitUris(uri),
+      };
     },
 
     async deleteBranch({ projectId, branchId }) {
@@ -159,6 +173,18 @@ export function createNeonClient({ apiKey, fetchImpl = fetch, logger = console }
       logger.log(`[Neon] deleted branch ${branchId}`);
       return true;
     },
+  };
+}
+
+/**
+ * What the branch actually is, as Neon reports it — not as the config asked for it. The prompt
+ * tells the agent whether its database holds rows, so a request Neon declined to honour must not
+ * turn into a confident claim in the prompt.
+ */
+function describeBranch(branch) {
+  return {
+    createdAt: branch?.created_at || null,
+    initSource: branch?.init_source || null,
   };
 }
 

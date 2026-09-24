@@ -8,6 +8,7 @@
       "execute_label": "agent:execute",
       "triage_label": "agent:triage",
       "mention": "@dev-agent",
+      "plan_folder": ".agent/plans",
       "agent_login": "dev-agent",
       "webhook_secret_env": "WEBHOOK_SECRET_MAIN_APP"
     },

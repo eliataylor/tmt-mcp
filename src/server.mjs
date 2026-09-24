@@ -1,11 +1,11 @@
+import crypto from 'node:crypto';
 import express from 'express';
 import { pathToFileURL } from 'node:url';
 
 import { openDatabase, databaseInfo, DEFAULT_DB_PATH } from './db.mjs';
 import { loadRegistry } from './projects.mjs';
 import { peekRepoFullName, requireBearer, resolveWebhookSecret, verifySignature } from './auth.mjs';
-import { classify } from './triggers.mjs';
-import { buildContext } from './context.mjs';
+import { handleDelivery } from './delivery.mjs';
 import * as queue from './queue.mjs';
 import { announceWebhookUrl } from './tunnel.mjs';
 import { controlPlaneGuard, githubSourceGuard } from './net-guards.mjs';
@@ -113,60 +113,17 @@ function mountWebhookRoutes(app, { db, registry, config, log }) {
       return res.status(202).json({ ok: true, ignored: true, reason: 'unregistered repository' });
     }
 
-    const payload = req.body;
-    const verdict = classify({ event, payload, project });
-
-    if (verdict.kind === 'ignore') {
-      return res.json({ ok: true, ignored: true, reason: verdict.reason });
-    }
-
-    if (verdict.kind === 'cancel') {
-      const cancelled = queue.cancelPending(db, {
-        projectSlug: project.slug,
-        issueNumber: payload.issue?.number,
-        reason: verdict.reason,
-      });
-      if (cancelled.length) {
-        log.info(
-          `Cancelled ${cancelled.length} pending task(s) for ${project.slug} #${payload.issue?.number}: ${verdict.reason}`
-        );
-      }
-      return res.json({ ok: true, cancelled, reason: verdict.reason });
-    }
-
-    const context = buildContext({
+    const result = handleDelivery({
+      db,
+      registry,
+      config,
+      log,
       event,
-      action: verdict.action,
-      payload,
-      project,
+      payload: req.body,
       deliveryId,
       deliveredAt: timestamp(),
     });
-
-    const { task, duplicate } = queue.enqueue(db, {
-      deliveryId,
-      project,
-      payload,
-      context,
-      action: verdict.action,
-      maxAttempts: config.maxAttempts,
-    });
-
-    if (duplicate) {
-      log.info(`Duplicate delivery ${deliveryId} ignored (task ${task?.id})`);
-      return res.json({ ok: true, duplicate: true, task_id: task?.id ?? null });
-    }
-
-    log.info(
-      `Queued ${verdict.action} for ${project.slug} (${repoFullName}) issue #${payload.issue?.number} -> ${task.id}`
-    );
-    return res.status(201).json({
-      ok: true,
-      duplicate: false,
-      task_id: task.id,
-      project_slug: project.slug,
-      action: verdict.action,
-    });
+    return res.status(result.status).json(result.body);
   });
 
   return app;
@@ -240,6 +197,37 @@ function mountControlRoutes(app, { db, registry, config, log }) {
     const task = queue.getTask(db, req.params.id);
     if (!task) return res.status(404).json({ error: 'No such task' });
     return res.json({ task });
+  });
+
+  /**
+   * Re-queue a delivery without GitHub HMAC — for recovery after tunnel outages.
+   * Body: { "event": "issues", "payload": { ... }, "delivery_id": "optional" }
+   */
+  app.post('/api/agent/ingest', guard, (req, res) => {
+    const body = req.body || {};
+    const event = body.event;
+    const payload = body.payload;
+    if (!event || typeof event !== 'string') {
+      return res.status(400).json({ error: 'event is required' });
+    }
+    if (!payload || typeof payload !== 'object') {
+      return res.status(400).json({ error: 'payload is required' });
+    }
+    const deliveryId =
+      body.delivery_id ||
+      body.deliveryId ||
+      `reconcile-${crypto.randomUUID?.() ?? Date.now()}`;
+    const result = handleDelivery({
+      db,
+      registry,
+      config,
+      log,
+      event,
+      payload,
+      deliveryId,
+      deliveredAt: timestamp(),
+    });
+    return res.status(result.status).json(result.body);
   });
 
   // ---------------------------------------------------------------- ops

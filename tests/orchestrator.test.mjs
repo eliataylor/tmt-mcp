@@ -16,6 +16,7 @@ import {
   toPooledUri,
 } from '../orchestrator/neon.mjs';
 import { buildPrompt } from '../orchestrator/prompt.mjs';
+import { resolvePosthogRunnerEnv } from '../orchestrator/posthog.mjs';
 import {
   buildRunArgs,
   containerNameFor,
@@ -201,6 +202,8 @@ describe('prompt rendering', () => {
     prUrl: 'https://github.com/my-org/primary-app/pull/101',
     action: 'agent:assigned',
     taskId: 'abc123def456',
+    planPath: '.agent/plans/PLAN-42.md',
+    planExists: true,
   });
 
   test('states where the agent is and what it is working on', () => {
@@ -253,10 +256,124 @@ describe('prompt rendering', () => {
     assert.match(executePrompt, /\*\*Execute\*\*/);
   });
 
-  test('plan tasks forbid code changes', () => {
+  test('plan tasks forbid product code changes', () => {
     assert.match(prompt, /Ground rules \(plan\)/);
     assert.match(prompt, /No product code changes/);
     assert.match(prompt, /\*\*Plan\*\*/);
+  });
+
+  // The orchestrator commits the plan so every run is exactly one revision; an agent that also
+  // committed or pasted the plan into the thread would bring back the noise this replaces.
+  test('plan tasks write only the plan file and leave git and the comment to the orchestrator', () => {
+    assert.match(prompt, /Plan file: `\/workspace\/\.agent\/plans\/PLAN-42\.md`/);
+    assert.match(prompt, /only file you may edit is `\/workspace\/\.agent\/plans\/PLAN-42\.md`/);
+    assert.match(prompt, /No git writes/);
+    assert.match(prompt, /Do \*\*not\*\* post the plan as an issue comment/);
+    assert.match(prompt, /<!-- summary: \.\.\. -->/);
+    assert.doesNotMatch(prompt, /## The plan comment/);
+  });
+
+  test('execute follows the plan file when the branch has one', () => {
+    const withPlan = buildPrompt({
+      context: issueContext,
+      branch: 'agent/issue-42',
+      prNumber: 101,
+      action: 'agent:execute',
+      taskId: 't-exec-plan',
+      planPath: '.agent/plans/PLAN-42.md',
+      planExists: true,
+    });
+    assert.match(withPlan, /Follow the plan in `\.agent\/plans\/PLAN-42\.md`/);
+    assert.match(withPlan, /supersedes older plan comments/);
+
+    const legacy = buildPrompt({
+      context: issueContext,
+      branch: 'agent/issue-42',
+      prNumber: 101,
+      action: 'agent:execute',
+      taskId: 't-exec-legacy',
+      planPath: '.agent/plans/PLAN-42.md',
+      planExists: false,
+    });
+    assert.match(legacy, /Follow the plan the thread agreed on/);
+    assert.match(legacy, /not on this branch yet/);
+  });
+
+  // An agent that checks $DATABASE_URL finds nothing, because the URL is written to a file in the
+  // clone. Without this section it concluded, reasonably and wrongly, that it had no database.
+  describe('the database section', () => {
+    const withBranch = (overrides = {}, action = 'agent:assigned') =>
+      buildPrompt({
+        context: issueContext,
+        branch: 'agent/issue-42',
+        prNumber: 101,
+        action,
+        taskId: 't-db',
+        neon: {
+          name: 'agent-issue-42',
+          parentBranch: 'main',
+          createdAt: '2026-09-16T18:04:11Z',
+          initSource: 'parent-data',
+          ...overrides,
+        },
+        now: Date.parse('2026-09-18T18:04:11Z'),
+      });
+
+    test('points at the file, because the shell has no DATABASE_URL to find', () => {
+      const dbPrompt = withBranch();
+      assert.match(dbPrompt, /`\/workspace\/\.env\.local` holds `DATABASE_URL`/);
+      assert.match(dbPrompt, /Neither is exported into your shell/);
+      assert.match(dbPrompt, /\$DATABASE_URL` is empty by design/);
+    });
+
+    test('dates the fork so a count is never reported as live', () => {
+      const dbPrompt = withBranch();
+      assert.match(dbPrompt, /forked from `main` at 2026-09-16T18:04:11Z \(2 days ago\)/);
+      assert.match(dbPrompt, /as of 2026-09-16T18:04:11Z/);
+      assert.match(dbPrompt, /never "right now"/);
+    });
+
+    // Neon reports what the branch is; the config only reports what was asked for. Promising rows
+    // that are not there would be worse than the silence this section replaces.
+    for (const initSource of ['parent-schema', 'schema-only']) {
+      test(`says the tables are empty when Neon reports ${initSource}`, () => {
+        const dbPrompt = withBranch({ initSource });
+        assert.match(dbPrompt, /schema only, no rows/);
+        assert.doesNotMatch(dbPrompt, /you can query real data/);
+      });
+    }
+
+    test('lets execute write and holds every other mode to queries', () => {
+      assert.match(withBranch({}, 'agent:execute'), /Write only what the task actually calls for/);
+      assert.match(withBranch(), /this mode writes nothing/);
+      assert.match(withBranch({}, 'comment_created'), /Run queries, not migrations/);
+    });
+
+    test('triage is told it has none, since triage provisions none', () => {
+      const triaged = buildPrompt({
+        context: issueContext,
+        branch: 'main',
+        prNumber: null,
+        action: 'agent:triage',
+        taskId: 't-db-triage',
+        neon: { name: 'agent-issue-42', parentBranch: 'main', initSource: 'parent-data' },
+      });
+      assert.match(triaged, /Database: none — triage runs no code/);
+      assert.doesNotMatch(triaged, /## Your database/);
+      assert.doesNotMatch(triaged, /DATABASE_URL/);
+    });
+
+    test('a project with no neon block says so rather than staying silent', () => {
+      const noDb = buildPrompt({
+        context: issueContext,
+        branch: 'agent/issue-42',
+        prNumber: 101,
+        action: 'agent:assigned',
+        taskId: 't-no-db',
+      });
+      assert.match(noDb, /Database: none — this project has no database branch configured/);
+      assert.doesNotMatch(noDb, /## Your database/);
+    });
   });
 
   describe('triage tasks', () => {
@@ -284,8 +401,20 @@ describe('prompt rendering', () => {
 
     test('cross-link by mention rather than by commenting on other issues', () => {
       assert.match(triagePrompt, /do not comment on those issues/);
-      assert.match(triagePrompt, /git log --oneline -- <path>/);
       assert.match(triagePrompt, /search_issues/);
+    });
+
+    test('ask for a difficulty and an estimate', () => {
+      assert.match(triagePrompt, /\*\*Difficulty:\*\* moderate · \*\*Estimate:\*\* 4-8h/);
+      for (const level of ['trivial', 'small', 'moderate', 'large', 'unknown']) {
+        assert.match(triagePrompt, new RegExp(`- \`${level}\` —`));
+      }
+      assert.match(triagePrompt, /review and QA excluded/);
+    });
+
+    test('cap the comment instead of inviting a report', () => {
+      assert.match(triagePrompt, /under 120 words/);
+      assert.match(triagePrompt, /no summary of what you read/);
     });
 
     test('keep labels on the triaged issue only', () => {
@@ -302,9 +431,9 @@ describe('prompt rendering', () => {
     });
 
     test('ask for the missing detail through the repo templates instead of guessing', () => {
-      assert.match(triagePrompt, /too thin to classify/);
-      assert.match(triagePrompt, /screenshot or short recording/);
+      assert.match(triagePrompt, /too thin to size or classify/);
       assert.match(triagePrompt, /\.github\/ISSUE_TEMPLATE\//);
+      assert.match(triagePrompt, /If you can size it, ask for nothing/);
     });
 
     // The fixture issue was opened 2026-09-16.
@@ -321,14 +450,15 @@ describe('prompt rendering', () => {
     test('a days-old issue is dated but not called stale', () => {
       const fresh = agedBy('2026-09-18T18:04:11Z');
       assert.match(fresh, /Opened: 2026-09-16T18:04:11Z \(2 days ago\)/);
-      assert.doesNotMatch(fresh, /may already be fixed/);
+      assert.doesNotMatch(fresh, /may show the fix already landed/);
+      assert.match(fresh, /Recommend closing; never close it yourself/);
     });
 
     test('a weeks-old issue is flagged as possibly already resolved', () => {
       const stale = agedBy('2026-10-16T18:04:11Z');
-      assert.match(stale, /This issue was opened 30 days ago, which is long enough/);
-      assert.match(stale, /may already be fixed/);
-      assert.match(stale, /Recommend closing it; do not close it yourself/);
+      assert.match(stale, /this issue was opened 30 days ago, old enough/);
+      assert.match(stale, /git log --since=2026-09-16 -- <path>/);
+      assert.match(stale, /Recommend closing; never close it yourself/);
     });
   });
 
@@ -348,7 +478,7 @@ describe('prompt rendering', () => {
       const otherModes = {
         'agent:triage': [/Ground rules \(plan\)/, /Ground rules \(execute\)/, /push to `origin/],
         'agent:assigned': [/Ground rules \(triage\)/, /Ground rules \(execute\)/, /push to `origin/],
-        'agent:execute': [/Ground rules \(triage\)/, /Ground rules \(plan\)/, /Finding the related issues/],
+        'agent:execute': [/Ground rules \(triage\)/, /Ground rules \(plan\)/, /\*\*Difficulty:\*\*/],
       };
 
       for (const [action, forbidden] of Object.entries(otherModes)) {
@@ -608,6 +738,8 @@ describe('docker argv builder', () => {
     assert.doesNotMatch(joined, /CURSOR_API_KEY/);
     assert.doesNotMatch(joined, /NEON_API_KEY/);
     assert.doesNotMatch(joined, /AGENT_POLL_SECRET/);
+    assert.doesNotMatch(joined, /POSTHOG_MCP_API_KEY/);
+    assert.doesNotMatch(joined, /phx_/);
   });
 
   test('applies the runtime hardening flags', () => {
@@ -717,8 +849,47 @@ describe('result.json validation', () => {
   });
 });
 
+describe('posthog runner env', () => {
+  test('returns nothing when no api key is configured', () => {
+    assert.deepEqual(resolvePosthogRunnerEnv({ project: {}, secrets: {} }), {});
+  });
+
+  test('merges project posthog block over global env defaults', () => {
+    const env = resolvePosthogRunnerEnv({
+      project: { posthog: { project_id: '99', read_only: false } },
+      secrets: { POSTHOG_MCP_API_KEY: 'phx_test' },
+      env: { POSTHOG_PROJECT_ID: '1', POSTHOG_ORGANIZATION_ID: 'org-a' },
+    });
+    assert.equal(env.POSTHOG_MCP_API_KEY, 'phx_test');
+    assert.equal(env.POSTHOG_PROJECT_ID, '99');
+    assert.equal(env.POSTHOG_ORGANIZATION_ID, 'org-a');
+    assert.equal(env.POSTHOG_MCP_READ_ONLY, 'false');
+  });
+
+  test('defaults to read-only when only the api key is set', () => {
+    const env = resolvePosthogRunnerEnv({
+      project: {},
+      secrets: { POSTHOG_MCP_API_KEY: 'phx_test' },
+    });
+    assert.equal(env.POSTHOG_MCP_READ_ONLY, 'true');
+  });
+});
+
 describe('secrets file', () => {
   const dirFor = (n) => createTaskDir({ tasksDir: tempDir(), slug: 's', issueNumber: n, taskId: 't' });
+
+  test('allows posthog credentials alongside github and cursor', () => {
+    const paths = dirFor(19);
+    writeSecrets(paths, {
+      GITHUB_TOKEN: 'gh',
+      CURSOR_API_KEY: 'cur',
+      POSTHOG_MCP_API_KEY: 'phx_abc',
+      POSTHOG_PROJECT_ID: '312809',
+    });
+    const body = readFileSync(paths.secretsEnv, 'utf8');
+    assert.match(body, /POSTHOG_MCP_API_KEY='phx_abc'/);
+    assert.match(body, /POSTHOG_PROJECT_ID='312809'/);
+  });
 
   test('refuses the neon api key, which is org-scoped and can delete projects', () => {
     assert.throws(

@@ -8,6 +8,13 @@
         "GITHUB_PERSONAL_ACCESS_TOKEN": "${env:GITHUB_PERSONAL_ACCESS_TOKEN}"
       }
     },
+    "posthog": {
+      "comment": "Optional for local orchestrator dev. Create a personal API key with the MCP Server preset. Pin project_id in the URL or headers when you use one key across environments.",
+      "url": "https://mcp.posthog.com/mcp?readonly=true",
+      "headers": {
+        "Authorization": "Bearer ${env:POSTHOG_MCP_API_KEY}"
+      }
+    },
     "sqlite-queue": {
       "comment": "Debugging convenience only. The server container holds this file open in WAL mode across a Docker bind mount, and WAL's shared-memory file does not cross the macOS VM boundary reliably — reads here can be stale or hit locking errors. Use GET /api/agent/tasks for anything that matters. See README.md.",
       "command": "npx",

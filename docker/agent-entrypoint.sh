@@ -89,17 +89,52 @@ export GITHUB_PERSONAL_ACCESS_TOKEN="${GITHUB_TOKEN}"
 
 # MCP config goes into the per-issue home volume, not into /workspace, so the target repository
 # stays untouched. --approve-mcps below is what lets it load without an interactive prompt.
-mkdir -p "${HOME}/.cursor" || fail_setup "cannot write ${HOME}/.cursor"
-cat > "${HOME}/.cursor/mcp.json" <<'JSON'
-{
-  "mcpServers": {
-    "github": {
-      "command": "github-mcp-server",
-      "args": ["stdio"]
+write_cursor_mcp_json() {
+  local mcp_path="${HOME}/.cursor/mcp.json"
+  local base
+  base="$(jq -n '{
+    mcpServers: {
+      github: { command: "github-mcp-server", args: ["stdio"] }
     }
-  }
+  }')"
+
+  if [ -z "${POSTHOG_MCP_API_KEY:-}" ]; then
+    echo "${base}" > "${mcp_path}"
+    chmod 600 "${mcp_path}" || true
+    return
+  fi
+
+  local read_only="${POSTHOG_MCP_READ_ONLY:-true}"
+  local url="https://mcp.posthog.com/mcp"
+  local query=""
+  case "${read_only}" in true|1|yes|TRUE|True) query="readonly=true" ;; esac
+  if [ -n "${POSTHOG_PROJECT_ID:-}" ]; then
+    if [ -n "${query}" ]; then query="${query}&"; fi
+    query="${query}project_id=${POSTHOG_PROJECT_ID}"
+  fi
+  if [ -n "${query}" ]; then url="${url}?${query}"; fi
+
+  local headers
+  headers="$(jq -n \
+    --arg auth "Bearer ${POSTHOG_MCP_API_KEY}" \
+    --arg org "${POSTHOG_ORGANIZATION_ID:-}" \
+    --arg proj "${POSTHOG_PROJECT_ID:-}" \
+    --arg ro "${read_only}" \
+    '{
+      Authorization: $auth
+    }
+    | if $org != "" then . + {"x-posthog-organization-id": $org} else . end
+    | if $proj != "" then . + {"x-posthog-project-id": $proj} else . end
+    | if ($ro == "true" or $ro == "1" or $ro == "yes" or $ro == "TRUE" or $ro == "True")
+      then . + {"x-posthog-read-only": "true"} else . end')"
+
+  echo "${base}" | jq --arg url "${url}" --argjson headers "${headers}" \
+    '.mcpServers.posthog = { url: $url, headers: $headers }' > "${mcp_path}"
+  chmod 600 "${mcp_path}" || true
 }
-JSON
+
+mkdir -p "${HOME}/.cursor" || fail_setup "cannot write ${HOME}/.cursor"
+write_cursor_mcp_json
 
 cd /workspace || fail_setup "cannot enter /workspace"
 
