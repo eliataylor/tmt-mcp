@@ -19,8 +19,14 @@ if [ "$(id -u)" = 0 ] && [ "${TMT_ENTRY_AS_AGENT:-}" != 1 ]; then
   exec gosu agent:agent env TMT_ENTRY_AS_AGENT=1 /usr/local/bin/agent-entrypoint.sh
 fi
 
-RESULT_FILE=/out/result.json
-LOG_FILE=/out/run.log
+# Tests set TMT_FS_PREFIX to a temp directory. Unset in the container, so these stay absolute.
+P="${TMT_FS_PREFIX:-}"
+RESULT_FILE="${P}/out/result.json"
+LOG_FILE="${P}/out/run.log"
+SECRETS_FILE="${P}/run/secrets/env"
+PROMPT_FILE="${P}/task/prompt.md"
+WORKSPACE="${P}/workspace"
+CA_FILE="${P}/etc/ssl/tmt/ca.crt"
 
 CHAT_ID="${CHAT_ID:-}"
 
@@ -56,45 +62,67 @@ fail_setup() {
 
 # Secrets arrive as a mounted 0600 file rather than environment variables, because docker inspect
 # reports anything passed with -e or --env-file in Config.Env.
-if [ -r /run/secrets/env ]; then
+if [ -r "${SECRETS_FILE}" ]; then
   set -a
   # shellcheck disable=SC1091
-  . /run/secrets/env
+  . "${SECRETS_FILE}"
   set +a
 else
-  fail_setup "/run/secrets/env is not readable"
+  fail_setup "${SECRETS_FILE} is not readable"
 fi
 
-: "${GITHUB_TOKEN:?GITHUB_TOKEN missing from /run/secrets/env}"
-: "${CURSOR_API_KEY:?CURSOR_API_KEY missing from /run/secrets/env}"
+# The GitHub token stays in the credential proxy. A stale secrets file must not be able to put it
+# back into this process, git, or the MCP server.
+unset GITHUB_TOKEN
 
-[ -r /task/prompt.md ] || fail_setup "/task/prompt.md is missing"
+: "${CURSOR_API_KEY:?CURSOR_API_KEY missing from secrets env}"
+: "${https_proxy:?https_proxy missing from secrets env}"
+[ -r "${CA_FILE}" ] || fail_setup "${CA_FILE} is not readable"
+[ -r "${PROMPT_FILE}" ] || fail_setup "${PROMPT_FILE} is missing"
+[ -n "${GITHUB_TOOLSETS:-}" ] || fail_setup "GITHUB_TOOLSETS is missing"
 
 # The clone is a bind mount owned by the host user, so git refuses it as dubious ownership
 # without this. Harmless when the uids already agree.
-git config --global --add safe.directory /workspace || true
+git config --global --add safe.directory "${WORKSPACE}" || true
 git config --global --add safe.directory '*' || true
 
-# Credential helper reads the token from the environment, so it never lands in .git/config on disk
-# and never appears in a remote URL.
-git config --global credential.helper \
-  '!f() { test "$1" = get && echo "username=x-access-token" && echo "password=${GITHUB_TOKEN}"; }; f'
+# No credential helper. Git talks to GitHub through the proxy, which injects the real token.
+# http.sslCAInfo replaces git's default bundle; git only speaks to GitHub, via that proxy.
+git config --global --unset-all credential.helper || true
+git config --global http.proxy "${https_proxy}"
+git config --global https.proxy "${https_proxy}"
+git config --global http.sslCAInfo "${CA_FILE}"
+git config --global http.version HTTP/1.1
 
 git config --global user.name "${GIT_AUTHOR_NAME:-tmt agent}"
 git config --global user.email "${GIT_AUTHOR_EMAIL:-agent@tmt.local}"
 
-# github-mcp-server reads its token from its own environment, which it inherits from cursor-agent.
-# Exporting it here avoids depending on placeholder expansion inside mcp.json.
-export GITHUB_PERSONAL_ACCESS_TOKEN="${GITHUB_TOKEN}"
+# NODE_EXTRA_CA_CERTS appends. SSL_CERT_FILE replaces the trust store, so it is set only on the
+# GitHub MCP server (below), which talks to api.github.com through the proxy and nothing else.
+# The dummy token is what github-mcp-server requires in order to start. The proxy discards it.
+export NODE_EXTRA_CA_CERTS="${CA_FILE}"
+export GITHUB_PERSONAL_ACCESS_TOKEN="tmt-dummy-github-token"
 
 # MCP config goes into the per-issue home volume, not into /workspace, so the target repository
 # stays untouched. --approve-mcps below is what lets it load without an interactive prompt.
 write_cursor_mcp_json() {
   local mcp_path="${HOME}/.cursor/mcp.json"
-  local base
-  base="$(jq -n '{
+  local github_env base
+  # Toolsets and lockdown come from the orchestrator. The dummy token and the proxy CA live in
+  # this env so the Go client does not inherit a real token and does not trust the public
+  # GitHub certificate (SSL_CERT_FILE replaces its trust store).
+  github_env="$(jq -n \
+    --arg toolsets "${GITHUB_TOOLSETS}" \
+    --arg readonly "${GITHUB_READ_ONLY:-}" \
+    --arg lockdown "${GITHUB_LOCKDOWN_MODE:-1}" \
+    --arg token "tmt-dummy-github-token" \
+    --arg ca "${CA_FILE}" \
+    '{GITHUB_TOOLSETS: $toolsets, GITHUB_LOCKDOWN_MODE: $lockdown,
+      GITHUB_PERSONAL_ACCESS_TOKEN: $token, SSL_CERT_FILE: $ca}
+     + (if $readonly == "" then {} else {GITHUB_READ_ONLY: $readonly} end)')"
+  base="$(jq -n --argjson env "${github_env}" '{
     mcpServers: {
-      github: { command: "github-mcp-server", args: ["stdio"] }
+      github: { command: "github-mcp-server", args: ["stdio"], env: $env }
     }
   }')"
 
@@ -136,7 +164,12 @@ write_cursor_mcp_json() {
 mkdir -p "${HOME}/.cursor" || fail_setup "cannot write ${HOME}/.cursor"
 write_cursor_mcp_json
 
-cd /workspace || fail_setup "cannot enter /workspace"
+# Tests stop once gitconfig and mcp.json exist. The container never sets this.
+if [ "${TMT_ENTRYPOINT_STOP:-}" = "config" ]; then
+  exit 0
+fi
+
+cd "${WORKSPACE}" || fail_setup "cannot enter ${WORKSPACE}"
 
 if [ -n "${SETUP_CMD:-}" ]; then
   echo "[entrypoint] running setup: ${SETUP_CMD}" | tee -a "${LOG_FILE}"
@@ -185,7 +218,7 @@ if [ -n "${AGENT_TIMEOUT_SECONDS:-}" ]; then
 fi
 
 # PIPESTATUS is why this is bash and not sh: tee must not mask the agent's exit code.
-"${agent[@]}" "${args[@]}" "$(cat /task/prompt.md)" 2>&1 | tee -a "${LOG_FILE}"
+"${agent[@]}" "${args[@]}" "$(cat "${PROMPT_FILE}")" 2>&1 | tee -a "${LOG_FILE}"
 code=${PIPESTATUS[0]}
 
 if [ "${code}" -eq 124 ] && [ -n "${AGENT_TIMEOUT_SECONDS:-}" ]; then

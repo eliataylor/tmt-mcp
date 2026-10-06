@@ -18,8 +18,9 @@ networks:
   # orchestrator can reference it without the compose project prefix.
   #
   # A user-defined bridge only connects containers attached to it, so a runner cannot reach the
-  # queue, cloudflared, or another runner, while outbound NAT still gives it the Cursor API, the
-  # GitHub API, and npm. That isolation is what lets the runner hold no queue credential at all.
+  # queue, cloudflared, or another runner. Egress is default-deny: runners may reach the credential
+  # proxy, npm, and the Cursor API; only the proxy may reach GitHub. That is what lets the runner
+  # hold no queue credential and no GitHub token.
   tmt-agent-runners:
     name: tmt-agent-runners
     driver: bridge

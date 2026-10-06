@@ -45,6 +45,45 @@ function ignore(reason) {
   return { kind: 'ignore', reason };
 }
 
+/** GitHub's write-level associations. CONTRIBUTOR has landed a commit and still cannot push. */
+const WRITE_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+
+function loginTrusted(login, project) {
+  if (!login) return false;
+  const needle = String(login).toLowerCase();
+  return (project.trusted_logins || []).some((entry) => String(entry).toLowerCase() === needle);
+}
+
+/**
+ * Comments and newly opened issues can come from anyone who can see the repo. Label and assign
+ * events are emitted only for users GitHub already allowed to edit the issue, so a missing
+ * association does not fail those closed. An explicit NONE still does.
+ */
+function isTrustedActor(event, payload, project) {
+  if (event === 'issue_comment') {
+    const login = payload.comment?.user?.login;
+    if (loginTrusted(login, project)) return true;
+    return WRITE_ASSOCIATIONS.has(payload.comment?.author_association);
+  }
+
+  const login = payload.sender?.login;
+  if (loginTrusted(login, project)) return true;
+  if (WRITE_ASSOCIATIONS.has(payload.sender?.author_association)) return true;
+
+  const action = payload.action;
+  if (action === 'opened' || action === 'reopened') {
+    const author = payload.issue?.user?.login;
+    const same = login && author && login.toLowerCase() === String(author).toLowerCase();
+    return Boolean(same) && WRITE_ASSOCIATIONS.has(payload.issue?.author_association);
+  }
+
+  if (action === 'labeled' || action === 'assigned') {
+    return !payload.sender?.author_association;
+  }
+
+  return false;
+}
+
 /**
  * The agent's own comments and label changes must never re-trigger it.
  *
@@ -62,9 +101,27 @@ function isAgentAuthor(user, project) {
   return Boolean(login) && String(user.login || '').toLowerCase() === String(login).toLowerCase();
 }
 
-/** Follow-up comments run in execute mode when the execute label is already on the issue. */
-function commentAction(payload, project) {
-  return hasExecuteLabel(payload, project) ? ACTIONS.EXECUTE : ACTIONS.COMMENT;
+/** @-mentions and issue bodies that call the agent in without a control label yet. */
+function mentionAction(payload, project) {
+  return hasExecuteLabel(payload, project) ? ACTIONS.EXECUTE : ACTIONS.ASSIGNED;
+}
+
+function escapeRegex(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function textHasMention(text, project) {
+  if (!text) return false;
+  const haystack = String(text);
+  if (project.mention && haystack.includes(project.mention)) return true;
+  const login = project.agent_login;
+  if (!login) return false;
+  const re = new RegExp(`@${escapeRegex(login)}(?:\\[bot\\])?(?:[^a-zA-Z0-9-]|$)`, 'i');
+  return re.test(haystack);
+}
+
+function issueBodyHasMention(payload, project) {
+  return textHasMention(payload?.issue?.body || '', project);
 }
 
 export function classify({ event, payload, project }) {
@@ -84,6 +141,9 @@ export function classify({ event, payload, project }) {
           return ignore('label was applied by the agent');
         }
         const name = payload.label?.name;
+        if (!isTrustedActor(event, payload, project)) {
+          return ignore('actor is not a write collaborator or a trusted login');
+        }
         if (name === project.execute_label) {
           return { kind: 'enqueue', action: ACTIONS.EXECUTE };
         }
@@ -97,13 +157,19 @@ export function classify({ event, payload, project }) {
       }
 
       case 'assigned':
-        if (project.agent_login && payload.assignee?.login === project.agent_login) {
-          return { kind: 'enqueue', action: ACTIONS.ASSIGNED };
+        if (!(project.agent_login && payload.assignee?.login === project.agent_login)) {
+          return ignore('assignee is not the agent login');
         }
-        return ignore('assignee is not the agent login');
+        if (!isTrustedActor(event, payload, project)) {
+          return ignore('actor is not a write collaborator or a trusted login');
+        }
+        return { kind: 'enqueue', action: ACTIONS.ASSIGNED };
 
       case 'opened':
       case 'reopened':
+        if (!isTrustedActor(event, payload, project)) {
+          return ignore('actor is not a write collaborator or a trusted login');
+        }
         if (hasExecuteLabel(payload, project)) {
           return { kind: 'enqueue', action: ACTIONS.EXECUTE };
         }
@@ -115,7 +181,10 @@ export function classify({ event, payload, project }) {
         if (hasTriageLabel(payload, project)) {
           return { kind: 'enqueue', action: ACTIONS.TRIAGE };
         }
-        return ignore('issue does not carry a trigger, execute or triage label');
+        if (issueBodyHasMention(payload, project)) {
+          return { kind: 'enqueue', action: mentionAction(payload, project) };
+        }
+        return ignore('issue does not carry a trigger, execute or triage label and body has no mention');
 
       case 'closed':
         return { kind: 'cancel', reason: 'issue closed' };
@@ -136,9 +205,12 @@ export function classify({ event, payload, project }) {
     if (isAgentAuthor(payload.comment?.user, project)) {
       return ignore('comment was written by the agent');
     }
+    if (!isTrustedActor(event, payload, project)) {
+      return ignore('actor is not a write collaborator or a trusted login');
+    }
     const body = payload.comment?.body || '';
-    if (project.mention && body.includes(project.mention)) {
-      return { kind: 'enqueue', action: commentAction(payload, project) };
+    if (textHasMention(body, project)) {
+      return { kind: 'enqueue', action: mentionAction(payload, project) };
     }
     if (hasExecuteLabel(payload, project)) {
       return { kind: 'enqueue', action: ACTIONS.EXECUTE };

@@ -2,7 +2,9 @@
 #   docker build -f docker/agent-runner.Dockerfile -t tmt-agent-runner .
 #
 # The container receives a per-task clone at /workspace, its prompt at /task, a writable /out for
-# its result, and credentials through a mounted file (GitHub + Cursor; optional PostHog MCP key).
+# its result, and credentials through a mounted file (Cursor, a proxy grant, optional PostHog).
+# The GitHub token is not in this container. The same image runs the credential proxy sidecar
+# (`node /usr/local/lib/tmt/cred-proxy.mjs`), which is the only process that mounts the token.
 # It has no route to the queue and
 # no Docker or Herdr socket. See orchestrator/runner.mjs for the mount allowlist.
 FROM node:22-bookworm-slim
@@ -12,7 +14,7 @@ FROM node:22-bookworm-slim
 ARG GITHUB_MCP_VERSION=1.12.2
 # cursor-agent resolves its own download, so the pin is a post-install version assertion: an
 # upstream bump fails the build here instead of silently changing the agent under you.
-ARG CURSOR_AGENT_VERSION=2026.09.18
+ARG CURSOR_AGENT_VERSION=2026.10.01
 # Deliberately no default: BuildKit fills this in from the target platform, and a default here
 # would shadow it and silently install an x86_64 binary into an arm64 image.
 ARG TARGETARCH
@@ -20,8 +22,11 @@ ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ripgrep because the agent leans on it for search; jq because the entrypoint writes result.json.
+# iptables is not for the agent: the orchestrator runs this image once, privileged, on the Docker
+# VM network namespace, to install the runner bridge's egress policy. openssl mints the proxy CA.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git curl ca-certificates ripgrep jq procps gosu \
+      git curl ca-certificates ripgrep jq procps gosu iptables openssl \
+    && mkdir -p /etc/ssl/tmt /usr/local/lib/tmt \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
@@ -43,6 +48,7 @@ RUN set -eux; \
     rm -rf /tmp/*
 
 COPY docker/agent-entrypoint.sh /usr/local/bin/agent-entrypoint.sh
+COPY orchestrator/cred-proxy.mjs /usr/local/lib/tmt/cred-proxy.mjs
 RUN chmod 0755 /usr/local/bin/agent-entrypoint.sh
 
 # A fixed uid so the per-issue home volume, which this image seeds, stays writable at runtime.

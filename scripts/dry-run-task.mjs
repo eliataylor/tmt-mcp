@@ -22,6 +22,7 @@ import {
 } from '../orchestrator/repo.mjs';
 import { isPlanAction } from '../orchestrator/plan.mjs';
 import { buildCreateBranchBody, branchNameFor as neonBranchNameFor } from '../orchestrator/neon.mjs';
+import { githubMcpEnv } from '../orchestrator/mcp.mjs';
 import { buildPrompt } from '../orchestrator/prompt.mjs';
 import {
   buildRunArgs,
@@ -191,7 +192,7 @@ console.log(`${taskDir}/`);
 console.log('  task.json      the full context manifest');
 console.log('  prompt.md      rendered below');
 console.log('  out/           result.json and run.log come back here');
-console.log('  secrets.env    0600, GITHUB_TOKEN + CURSOR_API_KEY (+ PostHog when POSTHOG_MCP_API_KEY is set)');
+console.log('  secrets.env    0600, proxy grant + CURSOR_API_KEY (+ PostHog when POSTHOG_MCP_API_KEY is set)');
 console.log(
   triage
     ? '\n  no .env.local: a triage task gets no database URL because it runs nothing'
@@ -208,6 +209,7 @@ const runArgs = buildRunArgs({
   taskDir,
   outDir: `${taskDir}/out`,
   secretsFile: `${taskDir}/secrets.env`,
+  caCert: `${config.paths.workdir}/cred-proxy/ca.crt`,
   homeVolume: homeVolumeFor({ slug, issueNumber }),
   npmCacheVolume: npmCacheVolumeFor({ slug }),
   modulesVolume: modulesVolumeFor({ slug }),
@@ -221,6 +223,7 @@ const runArgs = buildRunArgs({
     AGENT_MODEL: project.agent.model,
     SETUP_CMD: project.agent.setup_cmd,
     CHAT_ID: args.resume ? 'chat-from-state-json' : undefined,
+    ...githubMcpEnv(verdict.action),
   },
   labels: { project: slug, issue: String(issueNumber), 'task-id': taskId },
   detach: false,

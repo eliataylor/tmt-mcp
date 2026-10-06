@@ -1,4 +1,13 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -167,8 +176,8 @@ export async function prepareClone({
 
   const g = git(clonePath);
 
-  // HTTPS origin with no token in the URL. The runner's entrypoint installs a credential helper
-  // that reads GITHUB_TOKEN from the environment (SSH is not available inside the container).
+  // HTTPS origin with no token in the URL. The runner reaches GitHub through the credential proxy,
+  // which injects the token; SSH is not available inside the container.
   await g.run(['remote', 'set-url', 'origin', pushUrl]);
 
   // A read-only task (triage) stays on the default branch. Creating `agent/issue-<n>` for it would
@@ -393,6 +402,69 @@ export async function assertEnvLocalIgnored(clonePath, filename = '.env.local') 
         'into a file the agent could commit. Add it to .gitignore and retry.'
     );
   }
+}
+
+/**
+ * Copy `.git/config` and `.git/hooks` aside before the container starts.
+ *
+ * Taken before the agent runs, so a later restore cannot follow a symlink the agent planted at
+ * the destination: the destination is removed first, then the snapshot is copied back.
+ */
+export function snapshotGitMetadata(clonePath, destDir) {
+  const gitDir = gitDirOf(clonePath);
+  mkdirSync(destDir, { recursive: true, mode: 0o700 });
+  cpSync(join(gitDir, 'config'), join(destDir, 'config'));
+  const hooks = join(gitDir, 'hooks');
+  if (existsSync(hooks)) {
+    cpSync(hooks, join(destDir, 'hooks'), { recursive: true });
+  }
+}
+
+/** Put the pre-run config and hooks back, discarding whatever the container wrote. */
+export function restoreGitMetadata(clonePath, destDir) {
+  const gitDir = gitDirOf(clonePath);
+  const configSrc = join(destDir, 'config');
+  if (!existsSync(configSrc)) {
+    throw new Error(`git metadata snapshot at ${destDir} has no config`);
+  }
+  replacePath(configSrc, join(gitDir, 'config'));
+  const hooksSrc = join(destDir, 'hooks');
+  const hooksDest = join(gitDir, 'hooks');
+  removePath(hooksDest);
+  if (existsSync(hooksSrc)) cpSync(hooksSrc, hooksDest, { recursive: true });
+  else mkdirSync(hooksDest, { mode: 0o755 });
+}
+
+function gitDirOf(clonePath) {
+  const gitDir = join(clonePath, '.git');
+  let st;
+  try {
+    st = lstatSync(gitDir);
+  } catch {
+    throw new Error(`${gitDir} does not exist`);
+  }
+  if (!st.isDirectory()) {
+    throw new Error(`${gitDir} is not a directory; refusing to snapshot it`);
+  }
+  return gitDir;
+}
+
+function removePath(target) {
+  let st;
+  try {
+    st = lstatSync(target);
+  } catch (err) {
+    if (err.code === 'ENOENT') return;
+    throw err;
+  }
+  if (st.isSymbolicLink()) unlinkSync(target);
+  else if (st.isDirectory()) rmSync(target, { recursive: true, force: true });
+  else unlinkSync(target);
+}
+
+function replacePath(src, dest) {
+  removePath(dest);
+  cpSync(src, dest);
 }
 
 /** Configures the identity commits will carry. Run on the host so the container needs no git config. */

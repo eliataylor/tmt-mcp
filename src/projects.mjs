@@ -64,7 +64,21 @@ function normalizeProject(raw, index) {
     plan_folder: normalizePlanFolder(raw.plan_folder, `${where} (${raw.slug}) "plan_folder"`),
     agent_login: raw.agent_login || null,
     webhook_secret_env: raw.webhook_secret_env || null,
+    trusted_logins: normalizeTrustedLogins(raw.trusted_logins, `${where} (${raw.slug})`),
   };
+}
+
+function normalizeTrustedLogins(value, where) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new Error(`${where} "trusted_logins" must be an array of GitHub logins`);
+  }
+  return value.map((login, index) => {
+    if (typeof login !== 'string' || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(login)) {
+      throw new Error(`${where} trusted_logins[${index}] is not a GitHub login`);
+    }
+    return login;
+  });
 }
 
 function parseRegistry(json) {
@@ -181,6 +195,7 @@ export function loadRegistry({
         repo_key: key,
         agent_login: null,
         webhook_secret_env: null,
+        trusted_logins: [],
         synthesized: true,
       };
     },

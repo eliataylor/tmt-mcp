@@ -1,7 +1,42 @@
 import { execFile as execFileCb } from 'node:child_process';
+import { mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFileCb);
+
+/**
+ * Hooks, fsmonitor, and sshCommand in a clone's `.git/config` run as the host user. The agent can
+ * rewrite that config through the `/workspace` bind mount, so every host git command overrides it.
+ * An empty directory (not the clone's `.git/hooks`) is what makes a planted hook a no-op.
+ */
+export function hostGitHooksDir() {
+  const dir = join(tmpdir(), 'tmt-agent-no-hooks');
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
+/** argv fragment inserted before `-C` and the subcommand. */
+export function hostGitConfigArgs() {
+  return [
+    '-c',
+    `core.hooksPath=${hostGitHooksDir()}`,
+    '-c',
+    'core.fsmonitor=',
+    '-c',
+    'core.sshCommand=',
+  ];
+}
+
+function gitEnv(options = {}) {
+  return {
+    ...process.env,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_TERMINAL_PROMPT: '0',
+    ...options.env,
+  };
+}
 
 /**
  * Every process this daemon starts goes through here.
@@ -31,12 +66,13 @@ export async function succeeds(file, args, options = {}) {
 }
 
 export function git(cwd) {
-  const base = cwd ? ['-C', cwd] : [];
+  const base = [...hostGitConfigArgs(), ...(cwd ? ['-C', cwd] : [])];
+  const withGitEnv = (options = {}) => ({ ...options, env: gitEnv(options) });
   return {
-    run: (args, options) => run('git', [...base, ...args], options),
-    succeeds: (args, options) => succeeds('git', [...base, ...args], options),
+    run: (args, options) => run('git', [...base, ...args], withGitEnv(options)),
+    succeeds: (args, options) => succeeds('git', [...base, ...args], withGitEnv(options)),
     async capture(args, options) {
-      const { stdout } = await run('git', [...base, ...args], options);
+      const { stdout } = await run('git', [...base, ...args], withGitEnv(options));
       return stdout.trim();
     },
   };

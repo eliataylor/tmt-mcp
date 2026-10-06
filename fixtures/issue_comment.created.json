@@ -18,6 +18,7 @@
       { "id": 8812002, "name": "agent:assigned", "color": "0e8a16" }
     ],
     "assignees": [{ "login": "dev-agent", "id": 99120034, "type": "Bot" }],
+    "author_association": "OWNER",
     "body": "The scorer short-circuits when a candidate has no uploads and we end up writing a literal 0 instead of skipping the row.\n\nRelevant code:\n\n- https://github.com/my-org/primary-app/blob/main/src/services/MatchScoreService.ts#L118-L146\n- `src/lib/matchScore/messageBuilder.ts:88`\n\nRelated to #7."
   },
   "comment": {
@@ -28,6 +29,7 @@
     "created_at": "2026-09-17T23:12:40Z",
     "updated_at": "2026-09-17T23:12:40Z",
     "user": { "login": "eliataylor", "id": 4410021, "type": "User" },
+    "author_association": "OWNER",
     "body": "@dev-agent the fix also needs to cover the batch path in `scripts/backfill-unscored-match-scores.ts`, not just the live scorer.\n\nUse this shape:\n\n```ts path=src/lib/matchScore/types.ts\nexport type ScoreOutcome = { kind: 'scored'; value: number } | { kind: 'skipped'; reason: string };\n```\n\nSee https://github.com/my-org/primary-app/pull/58 for the earlier attempt."
   },
   "repository": {

@@ -10,6 +10,7 @@
       "mention": "@dev-agent",
       "plan_folder": ".agent/plans",
       "agent_login": "dev-agent",
+      "trusted_logins": [],
       "webhook_secret_env": "WEBHOOK_SECRET_MAIN_APP"
     },
     {

@@ -1,8 +1,13 @@
+import { randomBytes } from 'node:crypto';
 import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { ACTIONS } from '../src/triggers.mjs';
 import { loadConfig } from './config.mjs';
+import { ensureCredentialProxy, proxyUrl, registerGrant, revokeGrant, runnerSecrets } from './cred-proxy-host.mjs';
+import { directNoProxy, egressOptionsFrom } from './egress.mjs';
+import { assertNoLeak, leakNeedles } from './leak.mjs';
+import { githubMcpEnv } from './mcp.mjs';
 import { createQueueClient } from './queue-client.mjs';
 import { createStore } from './state.mjs';
 import { createGithubClient } from './github.mjs';
@@ -31,7 +36,9 @@ import {
   readPushedSha,
   renderPlanScaffold,
   resolvePlanRelativePath,
+  restoreGitMetadata,
   setCommitIdentity,
+  snapshotGitMetadata,
   writePlanScaffold,
 } from './repo.mjs';
 import {
@@ -105,7 +112,22 @@ async function bootChecks(ctx) {
   }
 
   // Runners are started with `docker run`, not compose, so the isolated network may not exist yet.
+  // The credential proxy joins that network before the egress rules, which name its address.
   await docker.ensureNetwork(config.runner.network);
+  ctx.proxy = await ensureCredentialProxy({
+    docker,
+    image: config.runner.image,
+    network: config.runner.network,
+    token: config.secrets.GITHUB_TOKEN,
+    workdir: config.paths.workdir,
+    dryRun: config.dryRun,
+    logger,
+  });
+  const egress = await docker.ensureEgress({
+    ...egressOptionsFrom(config),
+    sidecarIp: ctx.proxy.sidecarIp,
+  });
+  ctx.gatewayIp = egress.gateway;
 
   logger.log(
     `[Boot] herdr ${herdrAvailable ? 'available' : 'unavailable (containers will run detached)'}`
@@ -172,7 +194,11 @@ async function handleTask(ctx, task) {
   let prNumber = prior.pr_number || null;
   let workspaceId = null;
   let clonePath = null;
+  let gitMetaDir = null;
   let succeeded = false;
+  let releaseGrant = async () => {};
+  const canary = `tmt-canary-${randomBytes(16).toString('hex')}`;
+  const needles = leakNeedles({ secrets: config.secrets, canary });
 
   const stopHeartbeat = startHeartbeat(ctx, task, containerName, label);
 
@@ -298,16 +324,46 @@ async function handleTask(ctx, task) {
         neon: neonInfo,
         planPath,
         planExists,
+        canary,
       })
     );
 
-    // Runner credentials only. writeSecrets hard-fails on anything from the forbidden list, so the
-    // Neon key and the queue token cannot leak in here. PostHog is optional (see posthog.mjs).
-    writeSecrets(paths, {
-      GITHUB_TOKEN: config.secrets.GITHUB_TOKEN,
-      CURSOR_API_KEY: config.secrets.CURSOR_API_KEY,
-      ...resolvePosthogRunnerEnv({ project, secrets: config.secrets }),
-    });
+    // Runner credentials only. The GitHub token stays in the credential proxy; this file gets a
+    // per-task grant in the proxy URL, which is useless off the runner network. writeSecrets
+    // hard-fails on the Neon key and the queue token. PostHog is optional (see posthog.mjs).
+    const grant = randomBytes(32).toString('hex');
+    const egressOpts = egressOptionsFrom(config);
+    if (ctx.proxy?.adminSecret) {
+      if (!ctx.proxy.sidecarIp) throw new Error('credential proxy has no address');
+      await registerGrant({
+        adminPort: ctx.proxy.adminPort,
+        adminSecret: ctx.proxy.adminSecret,
+        grant,
+        owner,
+        repo: repoName,
+      });
+      releaseGrant = () =>
+        revokeGrant({
+          adminPort: ctx.proxy.adminPort,
+          adminSecret: ctx.proxy.adminSecret,
+          grant,
+        }).catch((err) => {
+          logger.warn(`[Task] ${label} could not revoke the proxy grant: ${err.message}`);
+        });
+    }
+    writeSecrets(
+      paths,
+      runnerSecrets({
+        cursorApiKey: config.secrets.CURSOR_API_KEY,
+        proxyUrl: proxyUrl({
+          host: ctx.proxy?.sidecarIp || '127.0.0.1',
+          port: ctx.proxy?.proxyPort,
+          grant,
+        }),
+        noProxy: directNoProxy({ posthog: egressOpts.posthog, extra: egressOpts.extraHosts }),
+        posthogEnv: resolvePosthogRunnerEnv({ project, secrets: config.secrets }),
+      })
+    );
 
     const runArgs = buildRunArgs({
       image: config.runner.image,
@@ -332,7 +388,10 @@ async function handleTask(ctx, task) {
         CHAT_ID: prior.chat_id,
         GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME || 'tmt agent',
         GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL || 'agent@tmt.local',
+        ...githubMcpEnv(task.action),
       },
+      gatewayIp: ctx.gatewayIp,
+      caCert: ctx.proxy?.caCert,
       labels: { project: slug, issue: String(issueNumber), 'task-id': task.id },
       // Always detached: herdr pane run only submits Enter in the pane and returns immediately.
       detach: true,
@@ -352,11 +411,16 @@ async function handleTask(ctx, task) {
         argv: paneRunLogArgv(paths.runLog),
       });
     }
+    gitMetaDir = join(paths.dir, 'git-meta');
+    snapshotGitMetadata(clonePath, gitMetaDir);
+
     await docker.start(runArgs);
 
     logger.log(`[Task] ${label} running as ${containerName}`);
 
     const exitCode = await waitForContainer(ctx, containerName, label);
+    // Before any host git: the container can rewrite .git/config and hooks, and those run as us.
+    restoreGitMetadata(clonePath, gitMetaDir);
     const result = readResult(paths);
 
     succeeded = result.valid ? result.exitCode === 0 : exitCode === 0;
@@ -384,6 +448,7 @@ async function handleTask(ctx, task) {
           headBefore,
           taskId: task.id,
           label,
+          needles,
         });
       } catch (err) {
         planFailure = `plan revision could not be published: ${err.message}`;
@@ -405,6 +470,7 @@ async function handleTask(ctx, task) {
         clonePath,
         action: task.action,
         label,
+        needles,
       });
       await queue.complete(task.id);
       logger.log(`[Task] ${label} completed`);
@@ -431,6 +497,7 @@ async function handleTask(ctx, task) {
       }
     }
   } finally {
+    await releaseGrant();
     stopHeartbeat();
     // The secrets file is shredded on every exit path, successful or not.
     shredSecrets(paths);
@@ -462,7 +529,16 @@ async function publishPlanRevision({
   headBefore,
   taskId,
   label,
+  needles,
 }) {
+  let planText = null;
+  try {
+    planText = readFileSync(join(clonePath, planPath), 'utf8');
+  } catch {
+    planText = null;
+  }
+  if (planText !== null) assertNoLeak(planText, needles);
+
   const revision = await commitPlanRevision({
     clonePath,
     planPath,
@@ -484,6 +560,7 @@ async function publishPlanRevision({
   if (!body) {
     throw new Error(`${planPath} has never been committed and the agent did not write it`);
   }
+  assertNoLeak(body, needles);
   await gh.commentOnIssue({ owner, repo, issueNumber, body });
   logger.log(
     `[Task] ${label} ${revision.changed ? `linked plan revision ${revision.revision}` : 'plan unchanged; commented'}`
@@ -497,7 +574,7 @@ async function publishPlanRevision({
  * the base branch and tells nobody anything. Silent when the repo has no hosting integration
  * reporting deployments to GitHub.
  */
-async function commentPreviewUrl(ctx, { gh, owner, repo, issueNumber, branch, clonePath, action, label }) {
+async function commentPreviewUrl(ctx, { gh, owner, repo, issueNumber, branch, clonePath, action, label, needles }) {
   const { preview } = ctx.config;
   if (!preview.enabled || action !== ACTIONS.EXECUTE) return;
 
@@ -524,6 +601,7 @@ async function commentPreviewUrl(ctx, { gh, owner, repo, issueNumber, branch, cl
       return;
     }
 
+    assertNoLeak(body, needles);
     await gh.commentOnIssue({ owner, repo, issueNumber, body });
     logger.log(`[Task] ${label} commented ${previews.length} preview URL(s)`);
   } catch (err) {

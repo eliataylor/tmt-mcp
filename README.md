@@ -74,6 +74,13 @@ where each issue's plan is committed as `PLAN-<issue>.md`. It must be a relative
 repository and must not be gitignored there — the orchestrator refuses to scaffold into an ignored
 folder, because every plan commit would come out empty.
 
+`trusted_logins` is optional. Comments and newly opened issues enqueue only when the actor's
+`author_association` is `OWNER`, `MEMBER`, or `COLLABORATOR`, or their login is in that list.
+Someone without write access cannot start a run by commenting on an issue that already carries
+`agent:execute`. Label and assign events are different: GitHub only delivers those for users who
+can already edit the issue, so a missing association is accepted. An association of `NONE` on the
+sender is still rejected.
+
 `webhook_secret_env` is optional; without it the project uses `GITHUB_WEBHOOK_SECRET`. With
 it, that repo's deliveries are verified against its own secret, so one tenant's webhook
 secret cannot be used to post as another. A declared-but-unset variable fails closed rather
@@ -95,8 +102,9 @@ name instead.
 | `issues.opened` / `reopened` | issue carries `execute_label` | queue `agent:execute` |
 | `issues.opened` / `reopened` | issue carries `trigger_label` (and not execute) | queue `agent:opened` (plan) |
 | `issues.opened` / `reopened` | issue carries `triage_label` only | queue `agent:triage` |
+| `issues.opened` / `reopened` | body contains `mention` or `@agent_login` (no control labels) | queue `agent:assigned` (plan) or `agent:execute` if `execute_label` is on the issue |
 | `issue_comment.created` | author is a `Bot`, or matches `agent_login` | ignored — the agent must not answer itself |
-| `issue_comment.created` | body contains `mention` | queue `comment_created` (plan) or `agent:execute` if `execute_label` is on the issue |
+| `issue_comment.created` | body contains `mention` or `@agent_login` | queue `agent:assigned` (plan) or `agent:execute` if `execute_label` is on the issue |
 | `issue_comment.created` | issue carries `execute_label` | queue `agent:execute` |
 | `issue_comment.created` | issue carries `trigger_label` only | queue `comment_created` (plan) |
 | `issues.closed` | — | cancel that issue's pending tasks |
@@ -342,9 +350,20 @@ own tunnel with its own hostname.
 
 Runner containers live on a third network, `tmt-agent-runners`, declared in the compose file but
 populated by the orchestrator's `docker run`. A user-defined bridge only connects containers
-attached to it, so a runner cannot reach the queue, cloudflared, or another runner, while
-outbound NAT still gives it the Cursor API, the GitHub API, and npm. That isolation is what lets
-a runner hold no queue credential at all.
+attached to it, so a runner cannot reach the queue, cloudflared, or another runner. At boot the
+orchestrator starts `tmt-cred-proxy` on that network and installs a default-deny filter
+(`TMT-AGENT-EGRESS` / `TMT-AGENT-INPUT` in the Docker VM). Packets to the gateway, to private
+ranges, and to the VM itself are rejected. Runners may open the proxy port on the sidecar and
+TCP 443 to the npm registry, the Cursor API, and PostHog when that key is set. Only the sidecar
+may open TCP 443 to GitHub, and it injects the token for the task's repo. The runner never sees
+the token string: git and the GitHub MCP server present a dummy credential, and the proxy
+replaces it. Names are blackholed as well (`host.docker.internal`, `gateway.docker.internal`,
+`tmt-gateway` → `127.0.0.1`); the filter is what rejects the gateway IP itself. The runner is
+still never given `AGENT_POLL_SECRET`, so a hole in the filter cannot claim or complete work.
+The allowlist is resolved at boot, so an orchestrator restart picks up address changes. Add a
+hostname with `RUNNER_EGRESS_ALLOW_HOSTS` when a setup command needs somewhere else. Rebuild the
+runner image after this change (`npm run runner:build`): the egress rules and the proxy both run
+from that image, which contains `iptables`, `openssl`, and `cred-proxy.mjs`.
 
 ### Why the control plane is TCP and not a unix socket
 
@@ -357,25 +376,6 @@ the VM boundary — the same class of problem as the WAL `-shm` caveat below.
 
 So the control plane is loopback TCP with the header guards above. `QUEUE_CONTROL_SOCKET` still
 exists in the orchestrator config for the case where the queue runs directly on the host.
-
-A user-defined bridge does **not** by itself keep a runner away from the host's published ports:
-measured on Docker Desktop, a container on `tmt-agent-runners` still resolves
-`host.docker.internal` (to an IPv6 ULA) and reaches a port published on the macOS host. That is
-what `--add-host host.docker.internal:127.0.0.1` and `--add-host gateway.docker.internal:127.0.0.1`
-are for, and they are load-bearing rather than belt-and-braces: with them, the same request fails
-to connect at all.
-
-The honest residual, all three states verified against a live control listener:
-
-| From a runner | Result |
-| --- | --- |
-| `host.docker.internal:3301`, aliases blackholed | connection refused |
-| Reaching the host address, `Host` header left alone | `403` — the Host allowlist rejects it |
-| Reaching the host address **and** forging `Host: 127.0.0.1:3301` | `/api/health` returns `200`; `/api/agent/poll` returns `401` |
-
-So a container that hardcodes the Docker Desktop host address and forges the Host header can read
-the unauthenticated health endpoint — SQLite version and task counts — and nothing more. Claiming
-or completing work needs `AGENT_POLL_SECRET`, which is exactly why the runner is never given it.
 
 ## Host orchestrator
 
@@ -452,12 +452,12 @@ project setting, not something this orchestrator can influence.
 
 Secrets reach the runner as a single 0600 `secrets.env` bind-mounted at `/run/secrets/env`, never
 as `-e` flags: `docker inspect` and `ps` both expose environment variables to any process on the
-host, and Docker persists them in container JSON. The file is shredded after the run. It always
-carries `GITHUB_TOKEN` and `CURSOR_API_KEY`. When `POSTHOG_MCP_API_KEY` is set in
-`.env.orchestrator`, the runner also gets PostHog MCP credentials (read-only by default) so the
-agent can query analytics, errors, and flags. `NEON_API_KEY` is asserted absent, since it is
-org-scoped and could delete whole projects while the runner only ever needs the `DATABASE_URL`
-that came out of it.
+host, and Docker persists them in container JSON. The file is shredded after the run. It carries
+`CURSOR_API_KEY` and a per-task proxy grant, not `GITHUB_TOKEN`. The token is mounted only into
+`tmt-cred-proxy`. When `POSTHOG_MCP_API_KEY` is set in `.env.orchestrator`, the runner also gets
+PostHog MCP credentials (read-only by default) so the agent can query analytics, errors, and
+flags. `NEON_API_KEY` is asserted absent, since it is org-scoped and could delete whole projects
+while the runner only ever needs the `DATABASE_URL` that came out of it.
 
 The container gets `--cap-drop ALL --security-opt no-new-privileges --read-only`, a tmpfs `/tmp`,
 and pid/memory/cpu/nofile limits, with writes confined to `/workspace`, `/out`, `/home/agent`, and

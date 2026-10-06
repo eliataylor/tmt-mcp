@@ -1,5 +1,12 @@
 import { statSync } from 'node:fs';
 
+import {
+  allowlistHosts,
+  parseRunnerNetwork,
+  partitionAllowlist,
+  renderEgressScript,
+  resolveAllowlist,
+} from './egress.mjs';
 import { run, succeeds } from './exec.mjs';
 
 /**
@@ -58,6 +65,7 @@ export function expectedMountTargets() {
     '/task',
     '/out',
     '/run/secrets/env',
+    '/etc/ssl/tmt/ca.crt',
     '/home/agent',
     '/home/agent/.npm',
     '/workspace/node_modules',
@@ -97,6 +105,8 @@ export function buildRunArgs({
   noExecTmp = false,
   matchHostUid = false,
   detach = true,
+  gatewayIp = null,
+  caCert = null,
 }) {
   const args = ['run'];
 
@@ -104,13 +114,16 @@ export function buildRunArgs({
   args.push('--name', containerName);
 
   // Isolated bridge: a user-defined network only connects containers attached to it, so this
-  // cannot reach the queue, cloudflared, or another runner, while outbound NAT still works.
+  // cannot reach the queue, cloudflared, or another runner. Outbound traffic is filtered by the
+  // egress chain installed on this network; NAT alone is not the allowlist.
   args.push('--network', network);
 
-  // Docker Desktop injects these names to reach the host. Blackholing them removes the easy path;
-  // the raw gateway IP still routes, which is why the runner holds no queue credential.
+  // Docker Desktop injects these names to reach the host. Blackholing them removes the easy path.
+  // The bridge gateway IP is rejected by the TMT-AGENT-EGRESS chain (see ensureEgress); mapping
+  // the name here covers tools that look the gateway up instead of dialing the raw address.
   args.push('--add-host', 'host.docker.internal:127.0.0.1');
   args.push('--add-host', 'gateway.docker.internal:127.0.0.1');
+  if (gatewayIp) args.push('--add-host', 'tmt-gateway:127.0.0.1');
 
   args.push('--cap-drop', 'ALL');
   // gosu in the entrypoint needs these after cap-drop; without them the container exits before
@@ -139,6 +152,8 @@ export function buildRunArgs({
   args.push('--volume', `${taskDir}:/task:ro`);
   args.push('--volume', `${outDir}:/out`);
   args.push('--volume', `${secretsFile}:/run/secrets/env:ro`);
+  if (!caCert) throw new Error('runner requires the credential proxy CA certificate');
+  args.push('--volume', `${caCert}:/etc/ssl/tmt/ca.crt:ro`);
   args.push('--volume', `${homeVolume}:/home/agent`);
   // Nested inside the home volume on purpose; the inner mount wins for that subtree.
   args.push('--volume', `${npmCacheVolume}:/home/agent/.npm`);
@@ -203,6 +218,59 @@ export function createDocker({ logger = console, dryRun = false } = {}) {
       logger.log(`[Docker] creating isolated runner network ${network}`);
       await run('docker', ['network', 'create', '--driver', 'bridge', network]);
       return true;
+    },
+
+    /**
+     * Default-deny for the runner bridge, applied in the Docker VM's filter table.
+     * Returns the gateway address so callers can blackhole its name on each container.
+     */
+    async ensureEgress({
+      network,
+      image,
+      posthog = false,
+      extraHosts = [],
+      resolve4,
+      sidecarIp = null,
+    } = {}) {
+      const hosts = allowlistHosts({ posthog, extra: extraHosts });
+      if (dryRun) {
+        logger.log(`[DryRun] egress policy for ${network} (${hosts.length} hosts)`);
+        return { gateway: null, allowedIps: [], sidecarIp };
+      }
+      if (!sidecarIp) {
+        throw new Error('runner egress requires the credential proxy address');
+      }
+
+      const { stdout } = await run('docker', ['network', 'inspect', network]);
+      const parsed = parseRunnerNetwork(JSON.parse(stdout));
+      const { github, direct } = partitionAllowlist(hosts);
+      const githubIps = await resolveAllowlist(github, { resolve4, logger });
+      const allowedIps = await resolveAllowlist(direct, { resolve4, logger });
+      const script = renderEgressScript({ ...parsed, allowedIps, githubIps, sidecarIp });
+      logger.log(
+        `[Docker] egress on ${parsed.bridge}: GitHub only from ${sidecarIp}, ` +
+          `${allowedIps.length} direct address(es) on :443`
+      );
+      try {
+        await run('docker', [
+          'run',
+          '--rm',
+          '--privileged',
+          '--network',
+          'host',
+          '--entrypoint',
+          'sh',
+          image,
+          '-c',
+          script,
+        ]);
+      } catch (err) {
+        throw new Error(
+          `Could not install runner egress rules. Rebuild the runner image so it contains iptables ` +
+            `(npm run runner:build). ${err.message}`
+        );
+      }
+      return { gateway: parsed.gateway, allowedIps };
     },
 
     async start(args) {

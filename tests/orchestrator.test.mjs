@@ -221,6 +221,20 @@ describe('prompt rendering', () => {
     assert.match(prompt, /untrusted data/i);
     assert.match(prompt, /<<<ISSUE_BODY/);
     assert.match(prompt, /ISSUE_BODY>>>/);
+    assert.match(prompt, /only set of instructions/);
+  });
+
+  test('plants a private marker the orchestrator can scan for later', () => {
+    const marked = buildPrompt({
+      context: issueContext,
+      branch: 'agent/issue-42',
+      prNumber: 101,
+      action: 'agent:assigned',
+      taskId: 'abc123def456',
+      canary: 'tmt-canary-0123456789abcdef0123456789abcdef',
+    });
+    assert.match(marked, /tmt-canary-0123456789abcdef0123456789abcdef/);
+    assert.match(marked, /never write this/);
   });
 
   test('a fence inside the issue body cannot terminate the delimiter early', () => {
@@ -681,6 +695,7 @@ describe('docker argv builder', () => {
     taskDir: '/Users/me/.tmt-agent/tasks/main-app-issue-42-abc12345',
     outDir: '/Users/me/.tmt-agent/tasks/main-app-issue-42-abc12345/out',
     secretsFile: '/Users/me/.tmt-agent/tasks/main-app-issue-42-abc12345/secrets.env',
+    caCert: '/Users/me/.tmt-agent/cred-proxy/ca.crt',
     homeVolume: 'tmt-agent-home-main-app-42',
     npmCacheVolume: 'tmt-agent-npm-main-app',
     modulesVolume: 'tmt-agent-modules-main-app',
@@ -763,6 +778,11 @@ describe('docker argv builder', () => {
     const joined = buildRunArgs(base).join(' ');
     assert.match(joined, /--add-host host\.docker\.internal:127\.0\.0\.1/);
     assert.match(joined, /--add-host gateway\.docker\.internal:127\.0\.0\.1/);
+  });
+
+  test('blackholes the bridge gateway name when the orchestrator knows its address', () => {
+    const joined = buildRunArgs({ ...base, gatewayIp: '172.28.0.1' }).join(' ');
+    assert.match(joined, /--add-host tmt-gateway:127\.0\.0\.1/);
   });
 
   test('noexec on /tmp stays opt-in, since an npm postinstall may exec from there', () => {
