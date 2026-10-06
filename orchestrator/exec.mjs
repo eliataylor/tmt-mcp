@@ -17,16 +17,33 @@ export function hostGitHooksDir() {
   return dir;
 }
 
-/** argv fragment inserted before `-C` and the subcommand. */
-export function hostGitConfigArgs() {
-  return [
+/**
+ * Answers `git credential fill` from `GITHUB_TOKEN` in the environment. The argv contains the
+ * variable name, not the token, and an empty `credential.helper` first drops every other helper
+ * so nothing writes the token into the clone.
+ */
+export const GITHUB_HTTPS_CREDENTIAL_HELPER =
+  '!f() { test "$1" = get && echo "username=x-access-token" && echo "password=$GITHUB_TOKEN"; }; f';
+
+/**
+ * argv fragment inserted before `-C` and the subcommand.
+ *
+ * `core.sshCommand` is cleared on clones the agent can rewrite. Mirror refresh passes
+ * `allowSsh`: that bare repo is not mounted into the container, and the host fetch is often
+ * `git@github.com`, which needs the real ssh.
+ */
+export function hostGitConfigArgs({ allowSsh = false, withGithubToken = false } = {}) {
+  const args = [
     '-c',
     `core.hooksPath=${hostGitHooksDir()}`,
     '-c',
     'core.fsmonitor=',
-    '-c',
-    'core.sshCommand=',
   ];
+  if (!allowSsh) args.push('-c', 'core.sshCommand=');
+  if (withGithubToken) {
+    args.push('-c', 'credential.helper=', '-c', `credential.helper=${GITHUB_HTTPS_CREDENTIAL_HELPER}`);
+  }
+  return args;
 }
 
 function gitEnv(options = {}) {
@@ -65,9 +82,20 @@ export async function succeeds(file, args, options = {}) {
   return result.code === 0;
 }
 
-export function git(cwd) {
-  const base = [...hostGitConfigArgs(), ...(cwd ? ['-C', cwd] : [])];
-  const withGitEnv = (options = {}) => ({ ...options, env: gitEnv(options) });
+export function git(cwd, { allowSsh = false, githubToken = null } = {}) {
+  const base = [
+    ...hostGitConfigArgs({ allowSsh, withGithubToken: Boolean(githubToken) }),
+    ...(cwd ? ['-C', cwd] : []),
+  ];
+  const withGitEnv = (options = {}) => ({
+    ...options,
+    env: gitEnv({
+      env: {
+        ...(githubToken ? { GITHUB_TOKEN: githubToken } : {}),
+        ...(options.env || {}),
+      },
+    }),
+  });
   return {
     run: (args, options) => run('git', [...base, ...args], withGitEnv(options)),
     succeeds: (args, options) => succeeds('git', [...base, ...args], withGitEnv(options)),

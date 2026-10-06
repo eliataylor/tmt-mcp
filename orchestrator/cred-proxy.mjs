@@ -17,7 +17,10 @@ import { pathToFileURL } from 'node:url';
  * response, a log line, or an error string.
  *
  * Runners authenticate with a per-task grant (Proxy-Authorization: Bearer, or Basic userinfo in
- * the proxy URL). The grant names one owner/repo. Paths outside that repo are rejected.
+ * the proxy URL). The grant names one owner/repo, and only that repo's requests receive the token.
+ * A public GET or HEAD to a GitHub host is forwarded with no Authorization, so a dependency
+ * install can download a release without a grant and without the token. Anything else outside
+ * the repo is rejected. A missing grant is not a tunnel to the rest of the internet.
  */
 
 export const GITHUB_MITM_HOSTS = [
@@ -26,6 +29,7 @@ export const GITHUB_MITM_HOSTS = [
   'codeload.github.com',
   'objects.githubusercontent.com',
   'github-releases.githubusercontent.com',
+  'release-assets.githubusercontent.com',
 ];
 
 export const PROXY_PORT = 3128;
@@ -319,10 +323,6 @@ export async function createCredentialProxy({
   proxy.on('connect', (req, clientSocket, head) => {
     const grant = parseProxyAuthorization(req.headers['proxy-authorization']);
     const scope = grant ? registry.get(grant) : null;
-    if (!scope) {
-      rejectConnect(clientSocket, '407 Proxy Authentication Required');
-      return;
-    }
     const target = parseConnectTarget(req.url);
     if (!target) {
       rejectConnect(clientSocket, '400 Bad Request');
@@ -333,7 +333,17 @@ export async function createCredentialProxy({
         rejectConnect(clientSocket, '403 Forbidden');
         return;
       }
+      // An unknown grant is rejected. No grant at all still terminates GitHub, so a public
+      // download is inspected and the token is never attached. It is not a blind tunnel.
+      if (grant && !scope) {
+        rejectConnect(clientSocket, '407 Proxy Authentication Required');
+        return;
+      }
       intercept(clientSocket, head, target.host, scope, { ca, leafs, readToken, dial, inners });
+      return;
+    }
+    if (!scope) {
+      rejectConnect(clientSocket, '407 Proxy Authentication Required');
       return;
     }
     tunnel(clientSocket, head, target.host, target.port, openTunnel);
@@ -402,25 +412,32 @@ function intercept(clientSocket, head, host, scope, ctx) {
 }
 
 function forward(req, res, host, scope, ctx) {
-  if (!requestAllowed(host, req.url, scope, req.method)) {
+  const method = String(req.method || 'GET').toUpperCase();
+  const allowed = Boolean(scope) && requestAllowed(host, req.url, scope, method);
+  // Public release downloads (and the signed CDN URL they redirect to) are GET/HEAD and must
+  // not carry the token. Writes outside the granted repo stay rejected.
+  const anonymous = !allowed && (method === 'GET' || method === 'HEAD');
+  if (!allowed && !anonymous) {
     req.resume();
     endPlain(res, 403);
-    return;
-  }
-  let token;
-  try {
-    token = ctx.readToken();
-    if (!token || typeof token !== 'string') throw new Error('empty');
-  } catch {
-    req.resume();
-    endPlain(res, 502);
     return;
   }
 
   const headers = { ...req.headers };
   for (const name of HOP_BY_HOP) delete headers[name];
   headers.host = host;
-  headers.authorization = authorizationFor(host, token);
+  if (allowed) {
+    let token;
+    try {
+      token = ctx.readToken();
+      if (!token || typeof token !== 'string') throw new Error('empty');
+    } catch {
+      req.resume();
+      endPlain(res, 502);
+      return;
+    }
+    headers.authorization = authorizationFor(host, token);
+  }
 
   const dialed = ctx.dial(host);
   const upstream = httpsRequest(

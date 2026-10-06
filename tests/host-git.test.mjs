@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { git, hostGitConfigArgs } from '../orchestrator/exec.mjs';
-import { restoreGitMetadata, snapshotGitMetadata } from '../orchestrator/repo.mjs';
+import { ensureMirror, restoreGitMetadata, snapshotGitMetadata } from '../orchestrator/repo.mjs';
 
 function initRepo() {
   const root = mkdtempSync(join(tmpdir(), 'host-git-'));
@@ -21,11 +21,38 @@ function initRepo() {
 }
 
 describe('host git overrides', () => {
-  test('every invocation disables hooks, fsmonitor, and sshCommand', () => {
+  test('clone git disables hooks, fsmonitor, and sshCommand; mirror git keeps ssh', () => {
     const args = hostGitConfigArgs().join(' ');
     assert.match(args, /core\.hooksPath=/);
     assert.match(args, /core\.fsmonitor=/);
     assert.match(args, /core\.sshCommand=/);
+    assert.doesNotMatch(hostGitConfigArgs({ allowSsh: true }).join(' '), /core\.sshCommand/);
+  });
+
+  test('https pushes take the token from the environment and do not store it in the clone', async () => {
+    const root = initRepo();
+    const token = 'ghp_host_push_token_value';
+    const args = hostGitConfigArgs({ withGithubToken: true }).join(' ');
+    assert.match(args, /credential\.helper=/);
+    assert.match(args, /\$GITHUB_TOKEN/);
+    assert.equal(args.includes(token), false);
+
+    const { stdout } = await git(root, { githubToken: token }).run(['credential', 'fill'], {
+      input: 'protocol=https\nhost=github.com\n\n',
+    });
+    assert.match(stdout, /username=x-access-token/);
+    assert.match(stdout, new RegExp(`password=${token}`));
+    assert.equal(readFileSync(join(root, '.git', 'config'), 'utf8').includes(token), false);
+
+    await assert.rejects(
+      () => git(root, { githubToken: token }).run(['push', '--set-upstream', 'origin', 'main']),
+      (err) => {
+        assert.equal(String(err.message).includes(token), false);
+        assert.match(String(err.message), /\$GITHUB_TOKEN/);
+        return true;
+      }
+    );
+    rmSync(root, { recursive: true, force: true });
   });
 
   test('a hook in the clone does not run when the host commits', async () => {
@@ -51,6 +78,28 @@ describe('host git overrides', () => {
     await git(root).run(['status', '--porcelain']);
     assert.throws(() => readFileSync(marker));
     rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe('mirror refresh', () => {
+  test('an existing mirror is pointed at the configured fetch url before update', async () => {
+    const upstream = initRepo();
+    const mirrors = mkdtempSync(join(tmpdir(), 'mirrors-'));
+    const mirror = join(mirrors, 'demo.git');
+    execFileSync('git', ['clone', '--mirror', '--quiet', upstream, mirror]);
+    execFileSync('git', ['-C', mirror, 'remote', 'set-url', 'origin', 'https://github.com/example/old.git']);
+
+    await ensureMirror({
+      mirrorsDir: mirrors,
+      slug: 'demo',
+      fetchUrl: upstream,
+      logger: { log() {} },
+    });
+
+    const url = execFileSync('git', ['-C', mirror, 'remote', 'get-url', 'origin'], { encoding: 'utf8' }).trim();
+    assert.equal(url, upstream);
+    rmSync(upstream, { recursive: true, force: true });
+    rmSync(mirrors, { recursive: true, force: true });
   });
 });
 

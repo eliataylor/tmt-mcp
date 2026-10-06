@@ -5,9 +5,15 @@ import {
   allowlistHosts,
   directNoProxy,
   gatewayFromSubnet,
+  githubSidecarDestinations,
+  GITHUB_SIDECAR_FALLBACK,
   parseRunnerNetwork,
   renderEgressScript,
   resolveAllowlist,
+  RUNNER_GATEWAY,
+  RUNNER_SUBNET,
+  runnerNetworkAction,
+  runnerNetworkCreateArgs,
   sidecarIpFromGateway,
 } from '../orchestrator/egress.mjs';
 import { assertNoLeak, leakHits, leakNeedles } from '../orchestrator/leak.mjs';
@@ -21,6 +27,7 @@ describe('egress allowlist', () => {
     assert.ok(plain.includes('github.com'));
     assert.ok(plain.includes('registry.npmjs.org'));
     assert.ok(plain.includes('api2.cursor.sh'));
+    assert.ok(plain.includes('agentn.global.api5.cursor.sh'));
     assert.ok(!plain.includes('mcp.posthog.com'));
     assert.ok(allowlistHosts({ posthog: true, extra: ['example.com'] }).includes('example.com'));
     assert.ok(allowlistHosts({ posthog: true }).includes('mcp.posthog.com'));
@@ -67,10 +74,48 @@ describe('egress allowlist', () => {
     assert.match(direct, /--dport 443 -j RETURN/);
     assert.doesNotMatch(direct, /-s 172\.28\.0\.2/);
     const proxyAt = script.indexOf('--dport 3128');
+    const dnsAt = script.indexOf('--dport 53');
     const privateAt = script.indexOf('-d 172.28.0.0/16 -j REJECT');
-    assert.ok(proxyAt !== -1 && proxyAt < privateAt);
+    assert.ok(proxyAt !== -1 && dnsAt !== -1 && proxyAt < dnsAt && dnsAt < privateAt);
+    assert.match(script, /\/etc\/resolv\.conf/);
+    assert.match(script, /nameserver/);
     assert.equal(sidecarIpFromGateway('172.28.0.1', '172.28.0.0/16'), '172.28.0.2');
+    assert.equal(RUNNER_SUBNET, '172.28.0.0/16');
+    assert.equal(RUNNER_GATEWAY, '172.28.0.1');
+    assert.deepEqual(runnerNetworkCreateArgs('tmt-agent-runners').slice(2, 7), [
+      '--driver',
+      'bridge',
+      '--subnet',
+      '172.28.0.0/16',
+      '--gateway',
+    ]);
+    const pinned = [{ Id: 'abcdef0123456789', IPAM: { Config: [{ Subnet: '172.28.0.0/16', Gateway: '172.28.0.1' }] }, Containers: {} }];
+    const auto = [{ Id: 'abcdef0123456789', IPAM: { Config: [{ Subnet: '172.18.0.0/16', Gateway: '172.18.0.1' }] }, Containers: {} }];
+    const busy = [{ Id: 'abcdef0123456789', IPAM: { Config: [{ Subnet: '172.18.0.0/16', Gateway: '172.18.0.1' }] }, Containers: { abc: {} } }];
+    assert.equal(runnerNetworkAction(null), 'create');
+    assert.equal(runnerNetworkAction(pinned), 'keep');
+    assert.equal(runnerNetworkAction(auto), 'recreate');
+    assert.equal(runnerNetworkAction(busy), 'busy');
+    const covered = renderEgressScript({
+      bridge: 'br-abcdef012345',
+      gateway: '172.28.0.1',
+      subnet: '172.28.0.0/16',
+      allowedIps: ['140.82.116.4', '104.16.0.1'],
+      githubIps: ['140.82.112.0/20'],
+      sidecarIp: '172.28.0.2',
+    });
+    assert.match(covered, /-s 172\.28\.0\.2 -p tcp -d 140\.82\.112\.0\/20 --dport 443 -j RETURN/);
+    assert.equal(covered.includes('140.82.116.4'), false);
+    assert.match(covered, /-d 104\.16\.0\.1 --dport 443 -j RETURN/);
+    assert.equal(githubSidecarDestinations({
+      web: ['140.82.112.0/20', '2a0a:a440::/29', '10.0.0.0/8'],
+      api: ['140.82.112.0/20'],
+      git: ['185.199.108.0/22'],
+      actions: ['4.148.0.0/16'],
+    }).join(','), '140.82.112.0/20,185.199.108.0/22');
+    assert.ok(GITHUB_SIDECAR_FALLBACK.includes('140.82.112.0/20'));
     assert.equal(directNoProxy().includes('github.com'), false);
+    assert.equal(directNoProxy().includes('.cursor.sh'), true);
     assert.equal(directNoProxy().includes('registry.npmjs.org'), true);
     assert.equal(directNoProxy({ posthog: true }).includes('mcp.posthog.com'), true);
   });

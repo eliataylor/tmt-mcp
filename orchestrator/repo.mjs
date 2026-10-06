@@ -52,18 +52,23 @@ export function ensureWorkdir(paths) {
 
 export async function ensureMirror({ mirrorsDir, slug, fetchUrl, localPath, logger = console }) {
   const mirror = mirrorPathFor(mirrorsDir, slug);
+  // The mirror is not mounted into the runner, so this fetch may use ssh-agent. Clones the agent
+  // can rewrite still go through git() with ssh disabled.
+  const mirrorGit = git(mirror, { allowSsh: true });
 
   if (!existsSync(mirror)) {
     // A local repo can seed the mirror cheaply; otherwise clone from GitHub.
     const source = localPath && existsSync(join(localPath, '.git')) ? localPath : fetchUrl;
     logger.log(`[Repo] creating mirror for ${slug} from ${source}`);
     await run('git', ['clone', '--mirror', source, mirror]);
-    // A mirror seeded locally would otherwise keep fetching from the local path forever.
-    await git(mirror).run(['remote', 'set-url', 'origin', fetchUrl]);
   }
 
+  // A mirror outlives config edits. A rename, or a switch from HTTPS to SSH, has to be applied
+  // here or refresh keeps the URL from the day the directory was created.
+  await mirrorGit.run(['remote', 'set-url', 'origin', fetchUrl]);
+
   logger.log(`[Repo] refreshing mirror for ${slug}`);
-  await git(mirror).run(['remote', 'update', '--prune']);
+  await mirrorGit.run(['remote', 'update', '--prune']);
   return mirror;
 }
 
@@ -264,6 +269,7 @@ export async function createStartCommit({
   branch,
   planPath,
   scaffold,
+  githubToken = null,
   logger = console,
 }) {
   const g = git(clonePath);
@@ -275,7 +281,7 @@ export async function createStartCommit({
   } else {
     await g.run(['commit', '--allow-empty', '-m', `chore(#${issueNumber}): start agent work`]);
   }
-  await g.run(['push', '--set-upstream', 'origin', branch]);
+  await pushBranch({ clonePath, branch, githubToken });
   logger.log(`[Repo] pushed ${branch}${wrote ? ` with ${planPath}` : ''}`);
 }
 
@@ -323,6 +329,7 @@ export async function commitPlanRevision({
   taskId,
   branch,
   headBefore,
+  githubToken = null,
   logger = console,
 }) {
   const g = git(clonePath);
@@ -360,15 +367,16 @@ export async function commitPlanRevision({
   const revision = subjects.filter((s) => REVISION_SUBJECT.test(s)).length + 1;
 
   await g.run(['commit', '-m', planRevisionMessage({ issueNumber, revision, taskId })]);
-  await g.run(['push', '--set-upstream', 'origin', branch]);
+  await pushBranch({ clonePath, branch, githubToken });
   const sha = await readHeadSha(clonePath);
   logger.log(`[Repo] #${issueNumber}: pushed plan revision ${revision} (${sha.slice(0, 7)})`);
 
   return { changed: true, sha, prevSha, revision, warnings };
 }
 
-export async function pushBranch({ clonePath, branch }) {
-  await git(clonePath).run(['push', '--set-upstream', 'origin', branch]);
+export async function pushBranch({ clonePath, branch, githubToken = null }) {
+  // HTTPS origin, no token in the URL. The helper reads GITHUB_TOKEN from this process only.
+  await git(clonePath, { githubToken }).run(['push', '--set-upstream', 'origin', branch]);
 }
 
 /**

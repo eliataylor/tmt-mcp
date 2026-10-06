@@ -21,9 +21,17 @@ networks:
   # queue, cloudflared, or another runner. Egress is default-deny: runners may reach the credential
   # proxy, npm, and the Cursor API; only the proxy may reach GitHub. That is what lets the runner
   # hold no queue credential and no GitHub token.
+  #
+  # The subnet is user-configured on purpose, and it matches RUNNER_SUBNET in orchestrator/egress.mjs.
+  # Docker refuses `docker run --ip` (the credential proxy's stable address) on a bridge whose
+  # subnet was only auto-assigned.
   tmt-agent-runners:
     name: tmt-agent-runners
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1
 
 services:
   webhook-server:

@@ -32,6 +32,7 @@ import {
 } from '../orchestrator/taskdir.mjs';
 import {
   awaitPreviews,
+  branchPreviewUrl,
   isSettled,
   renderPreviewComment,
   safeHttpUrl,
@@ -653,6 +654,32 @@ describe('preview deployment reporting', () => {
     assert.deepEqual([...new Set(gh.shas)], ['deadbeef']);
   });
 
+  test('a Vercel deployment host becomes the branch alias', () => {
+    assert.equal(
+      branchPreviewUrl('https://demo-4z8ywkqd0-match-bear.vercel.app/', 'agent/issue-179'),
+      'https://demo-git-agent-issue-179-match-bear.vercel.app/'
+    );
+    assert.equal(
+      branchPreviewUrl('https://app-git-x.vercel.app/', 'agent/issue-42'),
+      'https://app-git-x.vercel.app/'
+    );
+    assert.equal(
+      branchPreviewUrl('https://preview.example.com/app', 'agent/issue-42'),
+      'https://preview.example.com/app'
+    );
+  });
+
+  test('a long branch slug is shortened without dropping the Vercel scope', () => {
+    const url = branchPreviewUrl(
+      'https://demo-4z8ywkqd0-match-bear.vercel.app/',
+      `agent/issue-${'9'.repeat(80)}`
+    );
+    const host = new URL(url).hostname.replace(/\.vercel\.app$/, '');
+    assert.ok(host.length <= 63);
+    assert.match(host, /^demo-git-agent-issue-/);
+    assert.match(host, /-match-bear$/);
+  });
+
   test('the comment links the branch URL and names the build state', () => {
     const body = renderPreviewComment({
       previews: [
@@ -664,6 +691,23 @@ describe('preview deployment reporting', () => {
     assert.match(body, /agent\/issue-42/);
     assert.match(body, /abcdef1/);
     assert.match(body, /ready: https:\/\/app-git-x\.vercel\.app/);
+  });
+
+  test('the comment rewrites a commit deployment host into the branch alias', () => {
+    const body = renderPreviewComment({
+      previews: [
+        {
+          environment: 'Preview',
+          state: 'success',
+          url: 'https://demo-4z8ywkqd0-match-bear.vercel.app/',
+          logUrl: null,
+        },
+      ],
+      branch: 'agent/issue-179',
+      sha: 'abcdef1234567890',
+    });
+    assert.match(body, /https:\/\/demo-git-agent-issue-179-match-bear\.vercel\.app\//);
+    assert.doesNotMatch(body, /4z8ywkqd0/);
   });
 
   test('a failed build is still worth a comment, with its log', () => {

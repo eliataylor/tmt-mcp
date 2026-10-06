@@ -3,13 +3,12 @@ import { sanitizeText } from './taskdir.mjs';
 /**
  * Preview deployment URLs, read from GitHub rather than from the host that built them.
  *
- * Vercel's Git integration reports every deployment through GitHub's Deployments API and puts the
- * preview URL in the status's `environment_url`. Reading it there costs no new credential — the
- * orchestrator already holds a token with repo scope — and avoids the two brittle alternatives:
- * a Vercel API key plus per-project ids in config, or reconstructing
- * `<project>-git-<branch>-<scope>.vercel.app` by hand and hoping the slug and 63-character
- * truncation rules match. It also works unchanged for any other provider that reports deployments
- * the same way.
+ * Vercel's Git integration reports every deployment through GitHub's Deployments API and puts a
+ * preview URL in the status's `environment_url`. That value is the deployment's own host
+ * (`<project>-<id>-<scope>.vercel.app`), which changes on every push. The comment wants the branch
+ * alias (`<project>-git-<branch>-<scope>.vercel.app`), which keeps pointing at the newest push.
+ * Project and scope still come from the host GitHub reported, so this needs no Vercel API key and
+ * no project ids in config. Any other provider's URL is left as reported.
  */
 
 /** GitHub deployment status states that mean the build has not finished yet. */
@@ -58,7 +57,7 @@ function newestFirst(statuses) {
  *
  * State comes from the newest status, but the URL comes from the newest status that carries one:
  * a `failure` status often has no `environment_url` even though an earlier `in_progress` did, and
- * the branch URL is still the right link to hand a human in that case.
+ * that deployment host is still the right one to turn into a branch alias.
  */
 export function selectPreviewStatus(statuses = []) {
   const ordered = newestFirst(statuses);
@@ -127,6 +126,51 @@ export async function awaitPreviews({
   }
 }
 
+/**
+ * Vercel deployment hosts look like `demo-4z8ywkqd0-match-bear.vercel.app`: project, a 9-character
+ * deployment id that contains a digit, then the team scope. The branch alias swaps that id for
+ * `git-<branch>`, with `/` and other non-alphanumerics in the branch becoming hyphens. The
+ * subdomain is capped at 63 characters by shortening the branch slug and keeping project and scope.
+ * A host that is not that shape (already an alias, another provider, a custom domain) is returned
+ * unchanged.
+ */
+export function branchPreviewUrl(deploymentUrl, branch) {
+  let url;
+  try {
+    url = new URL(String(deploymentUrl));
+  } catch {
+    return deploymentUrl;
+  }
+  if (!url.hostname.endsWith('.vercel.app')) return deploymentUrl;
+
+  const label = url.hostname.slice(0, -'.vercel.app'.length);
+  const parts = label.split('-');
+  const hashIndexes = [];
+  for (let i = 1; i < parts.length; i += 1) {
+    if (/^(?=.*\d)[a-z0-9]{9}$/.test(parts[i])) hashIndexes.push(i);
+  }
+  if (hashIndexes.length !== 1) return url.toString();
+
+  const hashAt = hashIndexes[0];
+  const project = parts.slice(0, hashAt).join('-');
+  const team = parts.slice(hashAt + 1).join('-');
+  const slug = String(branch || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (!project || !slug) return url.toString();
+
+  const head = `${project}-git-`;
+  const tail = team ? `-${team}` : '';
+  const budget = 63 - head.length - tail.length;
+  if (budget < 1) return url.toString();
+  const trimmed = slug.slice(0, budget).replace(/-+$/g, '');
+  if (!trimmed) return url.toString();
+
+  url.hostname = `${head}${trimmed}${tail}.vercel.app`;
+  return url.toString();
+}
+
 /** Returns null when there is nothing worth saying, so the caller can skip the comment entirely. */
 export function renderPreviewComment({ previews, branch, sha }) {
   const found = (previews || []).filter((preview) => preview.state || preview.url);
@@ -134,7 +178,7 @@ export function renderPreviewComment({ previews, branch, sha }) {
 
   const lines = found.map((preview) => {
     const state = STATE_LABEL[preview.state] || preview.state || 'unknown state';
-    const target = preview.url || '_no URL reported_';
+    const target = preview.url ? branchPreviewUrl(preview.url, branch) : '_no URL reported_';
     const log = preview.logUrl ? ` ([build log](${preview.logUrl}))` : '';
     return `- **${preview.environment}** — ${state}: ${target}${log}`;
   });

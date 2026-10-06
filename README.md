@@ -353,9 +353,14 @@ populated by the orchestrator's `docker run`. A user-defined bridge only connect
 attached to it, so a runner cannot reach the queue, cloudflared, or another runner. At boot the
 orchestrator starts `tmt-cred-proxy` on that network and installs a default-deny filter
 (`TMT-AGENT-EGRESS` / `TMT-AGENT-INPUT` in the Docker VM). Packets to the gateway, to private
-ranges, and to the VM itself are rejected. Runners may open the proxy port on the sidecar and
+ranges, and to the VM itself are rejected. The one exception is DNS: containers resolve through
+Docker's stub, which forwards to the engine nameserver (a private address), so UDP and TCP 53
+to the nameservers in the VM's resolv.conf are allowed and nothing else on that range is.
+Runners may open the proxy port on the sidecar and
 TCP 443 to the npm registry, the Cursor API, and PostHog when that key is set. Only the sidecar
-may open TCP 443 to GitHub, and it injects the token for the task's repo. The runner never sees
+may open TCP 443 to GitHub. It injects the token for the task's repo, and forwards a public
+GET or HEAD to those hosts with no Authorization, which is how a dependency install downloads
+a release. The runner still cannot open GitHub itself. The runner never sees
 the token string: git and the GitHub MCP server present a dummy credential, and the proxy
 replaces it. Names are blackholed as well (`host.docker.internal`, `gateway.docker.internal`,
 `tmt-gateway` → `127.0.0.1`); the filter is what rejects the gateway IP itself. The runner is
@@ -419,7 +424,7 @@ overlapping ticks, and it polls only while under `MAX_CONCURRENT_TASKS`. Per tas
    moved to `canceled` (by closing the issue or removing the label) stops the container.
 7. **Plan revision.** On a successful plan task, the plan file committed and pushed as its own
    revision, and a link to that version commented on the issue (see [Plan mode](#plan-mode)).
-8. **Preview.** On a successful execute task, the deployment URL for the commit that was just
+8. **Preview.** On a successful execute task, the branch preview URL for the commit that was just
    pushed, commented on the issue.
 
 A triage task runs 1, 5, and 6 only: it clones read-only on the default branch and skips the branch,
@@ -427,11 +432,12 @@ PR, Neon, `.env.local`, and preview stages entirely.
 
 ### Preview deployment comments
 
-Vercel's Git integration reports deployments through GitHub's Deployments API and puts the preview
-URL in each status's `environment_url`, so the orchestrator reads it from GitHub with the token it
-already has — no Vercel API key, no project ids in `config/orchestrator.json`, and no guessing at
-how `agent/issue-42` becomes a hostname. Anything else that reports deployments to GitHub the same
-way is picked up for free.
+Vercel's Git integration reports deployments through GitHub's Deployments API. Each status's
+`environment_url` is that deployment's own host (`demo-4z8ywkqd0-match-bear.vercel.app`), which
+changes on every push. The comment rewrites a host of that shape into the branch alias
+(`demo-git-agent-issue-42-match-bear.vercel.app`) using the project and scope already in the
+hostname, so it needs no Vercel API key and no project ids in `config/orchestrator.json`. Hosts
+that are not a Vercel deployment URL are commented as GitHub reported them.
 
 Deployments are looked up by the pushed commit rather than by the branch, because a resumed issue
 keeps its earlier deployments and reporting one of those would describe the wrong build. The wait

@@ -14,7 +14,21 @@ export const GITHUB_EGRESS_HOSTS = [
   'codeload.github.com',
   'objects.githubusercontent.com',
   'github-releases.githubusercontent.com',
+  'release-assets.githubusercontent.com',
 ];
+
+/**
+ * Anycast ranges from GitHub's meta document. Used when that document cannot be fetched.
+ * A single A record goes stale within minutes; these prefixes are what the records move inside.
+ */
+export const GITHUB_SIDECAR_FALLBACK = [
+  '192.30.252.0/22',
+  '185.199.108.0/22',
+  '140.82.112.0/20',
+  '143.55.64.0/20',
+];
+
+const GITHUB_META_KEYS = ['web', 'api', 'git'];
 
 export const EGRESS_ALLOW_HOSTS = [
   ...GITHUB_EGRESS_HOSTS,
@@ -25,6 +39,10 @@ export const EGRESS_ALLOW_HOSTS = [
   'api2.cursor.sh',
   'api2geo.cursor.sh',
   'api2direct.cursor.sh',
+  'api3.cursor.sh',
+  // Server-assigned agent stream host. The HTTP/2 client always uses HTTPS_PROXY and does not
+  // consult NO_PROXY, so this name has to be reachable on :443 or the proxy returns 502.
+  'agentn.global.api5.cursor.sh',
   'marketplace.cursorapi.com',
 ];
 
@@ -35,6 +53,7 @@ const REQUIRED_HOSTS = new Set([
   'api.github.com',
   'registry.npmjs.org',
   'api2.cursor.sh',
+  'agentn.global.api5.cursor.sh',
 ]);
 
 const IPV4 =
@@ -70,8 +89,18 @@ export function partitionAllowlist(hosts) {
  */
 export function directNoProxy({ posthog = false, extra = [] } = {}) {
   const { direct } = partitionAllowlist(allowlistHosts({ posthog, extra }));
-  return ['localhost', '127.0.0.1', ...direct].join(',');
+  // Leading dots are suffix matches for clients that honor NO_PROXY. The agent HTTP/2 transport
+  // does not; its hosts are listed above so their addresses are allowed directly.
+  return ['localhost', '127.0.0.1', '.cursor.sh', '.cursor.com', '.cursorapi.com', ...direct].join(',');
 }
+
+/**
+ * User-configured subnet for `tmt-agent-runners`. Docker rejects `docker run --ip` on a bridge
+ * whose subnet was assigned automatically, which is how the credential proxy takes 172.28.0.2.
+ * Compose declares the same pool in docker-compose.dev.yml.
+ */
+export const RUNNER_SUBNET = '172.28.0.0/16';
+export const RUNNER_GATEWAY = '172.28.0.1';
 
 /** Pin the sidecar just after the gateway so egress rules have a stable address to name. */
 export function sidecarIpFromGateway(gateway, subnet) {
@@ -83,6 +112,19 @@ export function sidecarIpFromGateway(gateway, subnet) {
     throw new Error(`credential proxy address ${ip} is outside ${subnet}`);
   }
   return ip;
+}
+
+function isGithubDest(value) {
+  if (typeof value !== 'string' || value.includes(':')) return false;
+  if (IPV4.test(value)) return true;
+  if (!CIDR.test(value)) return false;
+  const bits = Number(value.split('/')[1]);
+  return bits >= 16 && bits <= 32;
+}
+
+function destinationCovers(ip, dest) {
+  if (dest === ip) return true;
+  return dest.includes('/') && ipv4InCidr(ip, dest);
 }
 
 function ipv4InCidr(ip, cidr) {
@@ -120,6 +162,36 @@ export function gatewayFromSubnet(cidr) {
   return parts.join('.');
 }
 
+/**
+ * `create` when the network is missing, `keep` when it already has the pinned subnet,
+ * `recreate` when it does not and nothing is attached, `busy` when it does not and a container is.
+ */
+export function runnerNetworkAction(inspect) {
+  if (!inspect) return 'create';
+  const parsed = parseRunnerNetwork(inspect);
+  if (parsed.subnet === RUNNER_SUBNET && parsed.gateway === RUNNER_GATEWAY) return 'keep';
+  const net = Array.isArray(inspect) ? inspect[0] : inspect;
+  const attached = Object.keys(net.Containers || {}).length;
+  return attached > 0 ? 'busy' : 'recreate';
+}
+
+export function runnerNetworkCreateArgs(network) {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(network || '')) {
+    throw new Error(`refusing to create network "${network}"`);
+  }
+  return [
+    'network',
+    'create',
+    '--driver',
+    'bridge',
+    '--subnet',
+    RUNNER_SUBNET,
+    '--gateway',
+    RUNNER_GATEWAY,
+    network,
+  ];
+}
+
 export function parseRunnerNetwork(inspect) {
   const net = Array.isArray(inspect) ? inspect[0] : inspect;
   if (!net || typeof net !== 'object') throw new Error('docker network inspect returned no network');
@@ -138,6 +210,29 @@ export function parseRunnerNetwork(inspect) {
     throw new Error(`runner network subnet is not IPv4 CIDR: ${subnet}`);
   }
   return { bridge, gateway, subnet };
+}
+
+/** IPv4 prefixes from GitHub's published web, api, and git lists. IPv6 and other products are dropped. */
+export function githubSidecarDestinations(meta) {
+  const dests = new Set();
+  for (const key of GITHUB_META_KEYS) {
+    const list = meta?.[key];
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      if (typeof item !== 'string' || !isGithubDest(item)) continue;
+      dests.add(item);
+    }
+  }
+  return [...dests];
+}
+
+export async function fetchGithubMeta({ fetchImpl = globalThis.fetch, timeoutMs = 5000 } = {}) {
+  const res = await fetchImpl('https://api.github.com/meta', {
+    headers: { 'user-agent': 'tmt-mcp', accept: 'application/vnd.github+json' },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error(`GitHub meta returned ${res.status}`);
+  return res.json();
 }
 
 /**
@@ -199,13 +294,17 @@ export function renderEgressScript({
     assertPort(proxyPort);
     assertPort(adminPort);
   }
-  for (const ip of [...allowedIps, ...githubIps]) {
+  for (const ip of allowedIps) {
     if (!IPV4.test(ip)) throw new Error(`refusing egress script for address "${ip}"`);
   }
+  for (const dest of githubIps) {
+    if (!isGithubDest(dest)) throw new Error(`refusing egress script for GitHub destination "${dest}"`);
+  }
 
-  // A GitHub address that also appears in the direct list would let a runner skip the proxy.
-  const githubSet = new Set(githubIps);
-  const directIps = sidecarIp ? allowedIps.filter((ip) => !githubSet.has(ip)) : allowedIps;
+  // A runner allow-rule for an address inside a GitHub prefix would let it skip the proxy.
+  const directIps = sidecarIp
+    ? allowedIps.filter((ip) => !githubIps.some((dest) => destinationCovers(ip, dest)))
+    : allowedIps;
 
   const lines = ['set -eu', 'if iptables -S DOCKER-USER >/dev/null 2>&1; then IPT=iptables'];
   lines.push('elif command -v iptables-legacy >/dev/null 2>&1 && iptables-legacy -S DOCKER-USER >/dev/null 2>&1; then IPT=iptables-legacy');
@@ -226,6 +325,11 @@ export function renderEgressScript({
       `$IPT -A TMT-AGENT-EGRESS -i ${bridge} -p tcp -d ${sidecarIp} --dport ${adminPort} -j RETURN`
     );
   }
+  // Docker Desktop forwards the container stub (127.0.0.11) to a nameserver on a private
+  // address (192.168.65.7). That forward leaves via the bridge, so the private-range reject
+  // below would drop it and every lookup would fail with EAI_AGAIN. Port 53 to those
+  // nameservers only; the rest of the private range stays rejected.
+  lines.push(...dnsAllowLines(bridge));
   lines.push(`$IPT -A TMT-AGENT-EGRESS -i ${bridge} -d ${gateway} -j REJECT`);
   if (subnet) lines.push(`$IPT -A TMT-AGENT-EGRESS -i ${bridge} -d ${subnet} -j REJECT`);
   for (const cidr of PRIVATE_CIDRS) {
@@ -254,6 +358,21 @@ export function renderEgressScript({
   lines.push('fi');
 
   return `${lines.join('\n')}\n`;
+}
+
+function dnsAllowLines(bridge) {
+  return [
+    'if [ -r /etc/resolv.conf ]; then',
+    '  while IFS= read -r ns; do',
+    '    printf \'%s\' "$ns" | grep -Eq \'^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}$\' || continue',
+    '    case "$ns" in 127.*) continue ;; esac',
+    `    $IPT -A TMT-AGENT-EGRESS -i ${bridge} -p udp -d "$ns" --dport 53 -j RETURN`,
+    `    $IPT -A TMT-AGENT-EGRESS -i ${bridge} -p tcp -d "$ns" --dport 53 -j RETURN`,
+    '  done <<EOF',
+    '$(awk \'/^nameserver[[:space:]]+/ { print $2 }\' /etc/resolv.conf)',
+    'EOF',
+    'fi',
+  ];
 }
 
 function assertPort(port) {

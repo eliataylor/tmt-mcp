@@ -253,6 +253,7 @@ async function handleTask(ctx, task) {
           branch: clone.branch,
           planPath,
           scaffold,
+          githubToken: config.secrets.GITHUB_TOKEN,
           logger,
         });
       } else if (planning && !planFileExists({ clonePath, planPath })) {
@@ -447,6 +448,7 @@ async function handleTask(ctx, task) {
           branch: clone.branch,
           headBefore,
           taskId: task.id,
+          githubToken: config.secrets.GITHUB_TOKEN,
           label,
           needles,
         });
@@ -530,6 +532,7 @@ async function publishPlanRevision({
   taskId,
   label,
   needles,
+  githubToken = null,
 }) {
   let planText = null;
   try {
@@ -546,6 +549,7 @@ async function publishPlanRevision({
     taskId,
     branch,
     headBefore,
+    githubToken,
     logger,
   });
 

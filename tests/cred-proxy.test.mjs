@@ -128,10 +128,18 @@ describe('credential proxy', { concurrency: 1 }, () => {
     await adminJson(proxy, 'POST', '/grants', { grant: GRANT_A, owner: 'Acme', repo: 'widgets' });
   });
 
-  test('a request without a grant is rejected and never reaches upstream', async () => {
+  test('a request without a grant does not receive the token', async () => {
     const before = seen.length;
-    await assert.rejects(connectRequest({ proxy, host: 'api.github.com', path: '/user' }), /407/);
-    assert.equal(seen.length, before);
+    const res = await connectRequest({ proxy, host: 'api.github.com', path: '/user' });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.includes(TOKEN), false);
+    assert.equal(seen.at(-1).authorization, '');
+    assert.equal(seen.length, before + 1);
+
+    const authed = await connectRequest({ proxy, grant: GRANT_A, host: 'api.github.com', path: '/user' });
+    assert.equal(authed.status, 200);
+    assert.equal(authed.body.includes(TOKEN), false);
+    assert.equal(seen.at(-1).authorization, `Bearer ${TOKEN}`);
   });
 
   test('a grant for repo A cannot fetch repo B, and the client never sees the token', async () => {
@@ -140,13 +148,28 @@ describe('credential proxy', { concurrency: 1 }, () => {
       proxy,
       grant: GRANT_A,
       host: 'api.github.com',
+      method: 'POST',
       path: '/repos/Acme/other',
       headers: { authorization: 'Bearer client-sent-secret' },
+      body: 'nope',
     });
     assert.equal(denied.status, 403);
     assert.equal(denied.body, 'rejected');
     assert.equal(denied.body.includes(TOKEN), false);
     assert.equal(seen.length, before);
+
+    const pub = await connectRequest({
+      proxy,
+      grant: GRANT_A,
+      host: 'api.github.com',
+      path: '/repos/PostHog/posthog/releases/download/posthog-cli-v0.5.30/cli.tar.gz',
+      headers: { authorization: 'Bearer client-sent-secret' },
+    });
+    assert.equal(pub.status, 200);
+    assert.equal(pub.body.includes(TOKEN), false);
+    const publicHit = seen.at(-1);
+    assert.equal(publicHit.authorization, '');
+    assert.equal(publicHit.url.includes('PostHog/posthog'), true);
 
     const allowed = await connectRequest({
       proxy,
@@ -187,6 +210,39 @@ describe('credential proxy', { concurrency: 1 }, () => {
     assert.equal(Buffer.from(packed.authorization.slice(6), 'base64').toString(), `x-access-token:${TOKEN}`);
     assert.equal(packed.body.length, body.length);
     assert.ok(packed.body.equals(body));
+  });
+
+  test('a public GitHub GET with no grant is forwarded and carries no token', async () => {
+    const before = seen.length;
+    const pub = await connectRequest({
+      proxy,
+      host: 'github.com',
+      path: '/PostHog/posthog/releases/download/posthog-cli-v0.5.30/cli.tar.gz',
+      headers: { authorization: 'Bearer client-sent-secret' },
+    });
+    assert.equal(pub.status, 200);
+    assert.equal(pub.body.includes(TOKEN), false);
+    const hit = seen.at(-1);
+    assert.equal(hit.authorization, '');
+    assert.equal(seen.length, before + 1);
+
+    const posted = await connectRequest({
+      proxy,
+      host: 'api.github.com',
+      method: 'POST',
+      path: '/repos/PostHog/posthog/issues',
+      body: 'nope',
+    });
+    assert.equal(posted.status, 403);
+    assert.equal(seen.length, before + 1);
+  });
+
+  test('a non-GitHub host without a grant is not tunneled', async () => {
+    const socket = netConnect(proxy.proxyPort, '127.0.0.1');
+    socket.write('CONNECT registry.npmjs.org:443 HTTP/1.1\r\nHost: registry.npmjs.org:443\r\n\r\n');
+    const status = await readHeader(socket);
+    socket.destroy();
+    assert.match(status, /407/);
   });
 
   test('an unknown grant and a revoked grant are both rejected', async () => {

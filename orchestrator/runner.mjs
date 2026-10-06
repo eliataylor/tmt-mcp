@@ -5,7 +5,13 @@ import {
   parseRunnerNetwork,
   partitionAllowlist,
   renderEgressScript,
+  fetchGithubMeta,
+  githubSidecarDestinations,
+  GITHUB_SIDECAR_FALLBACK,
   resolveAllowlist,
+  RUNNER_SUBNET,
+  runnerNetworkAction,
+  runnerNetworkCreateArgs,
 } from './egress.mjs';
 import { run, succeeds } from './exec.mjs';
 
@@ -214,9 +220,29 @@ export function createDocker({ logger = console, dryRun = false } = {}) {
     },
 
     async ensureNetwork(network) {
-      if (await this.networkExists(network)) return false;
-      logger.log(`[Docker] creating isolated runner network ${network}`);
-      await run('docker', ['network', 'create', '--driver', 'bridge', network]);
+      if (dryRun) {
+        logger.log(`[DryRun] runner network ${network} (${RUNNER_SUBNET})`);
+        return false;
+      }
+      const inspected = await run('docker', ['network', 'inspect', network], { allowFailure: true });
+      const current = inspected.code === 0 ? JSON.parse(inspected.stdout) : null;
+      const action = runnerNetworkAction(current);
+      if (action === 'keep') return false;
+      if (action === 'busy') {
+        throw new Error(
+          `Runner network ${network} has no user-configured subnet ${RUNNER_SUBNET}, and a container is still attached. ` +
+            `Stop it, then remove the network (docker network rm ${network}) so the credential proxy can take a fixed address.`
+        );
+      }
+      if (action === 'recreate') {
+        logger.log(
+          `[Docker] recreating ${network} with subnet ${RUNNER_SUBNET} so the credential proxy can take a fixed address`
+        );
+        await run('docker', ['network', 'rm', network]);
+      } else {
+        logger.log(`[Docker] creating isolated runner network ${network} (${RUNNER_SUBNET})`);
+      }
+      await run('docker', runnerNetworkCreateArgs(network));
       return true;
     },
 
@@ -244,11 +270,22 @@ export function createDocker({ logger = console, dryRun = false } = {}) {
       const { stdout } = await run('docker', ['network', 'inspect', network]);
       const parsed = parseRunnerNetwork(JSON.parse(stdout));
       const { github, direct } = partitionAllowlist(hosts);
-      const githubIps = await resolveAllowlist(github, { resolve4, logger });
+      let githubIps;
+      try {
+        githubIps = githubSidecarDestinations(await fetchGithubMeta());
+        if (!githubIps.length) throw new Error('GitHub meta had no usable ranges');
+      } catch (err) {
+        logger.warn(`[Egress] using built-in GitHub ranges (${err.message})`);
+        githubIps = [...GITHUB_SIDECAR_FALLBACK];
+      }
+      // A GitHub name that falls outside the published ranges is still allowed from the sidecar only.
+      for (const ip of await resolveAllowlist(github, { resolve4, logger })) {
+        if (!githubIps.some((dest) => dest === ip)) githubIps.push(ip);
+      }
       const allowedIps = await resolveAllowlist(direct, { resolve4, logger });
       const script = renderEgressScript({ ...parsed, allowedIps, githubIps, sidecarIp });
       logger.log(
-        `[Docker] egress on ${parsed.bridge}: GitHub only from ${sidecarIp}, ` +
+        `[Docker] egress on ${parsed.bridge}: GitHub ranges only from ${sidecarIp}, ` +
           `${allowedIps.length} direct address(es) on :443`
       );
       try {
