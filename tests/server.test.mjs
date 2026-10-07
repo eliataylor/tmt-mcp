@@ -9,6 +9,7 @@ import { fixtureBuffer } from './helpers.mjs';
 
 const CONFIG_PATH = new URL('../fixtures/projects.test.json', import.meta.url).pathname;
 const MAIN_SECRET = 'scoped-secret-for-main-app';
+const SIDE_SECRET = 'scoped-secret-for-side-project';
 const GLOBAL_SECRET = 'global-fallback-secret';
 const POLL_SECRET = 'poll-secret';
 
@@ -17,7 +18,7 @@ const silent = createLogger('test', { log() {}, warn() {}, error() {} });
 /** Boot a real HTTP server so the test exercises Express, not just the handlers. */
 async function startServer({ projectSlug = null } = {}) {
   const db = openDatabase(':memory:');
-  const registry = loadRegistry({ configPath: CONFIG_PATH, projectSlug, allowUnknownRepos: false });
+  const registry = loadRegistry({ configPath: CONFIG_PATH, projectSlug });
   const config = { ...loadConfig({}), pollSecret: POLL_SECRET };
   const app = createApp({ db, registry, config, log: silent });
 
@@ -52,11 +53,13 @@ async function startServer({ projectSlug = null } = {}) {
 
 before(() => {
   process.env.WEBHOOK_SECRET_MAIN_APP = MAIN_SECRET;
+  process.env.WEBHOOK_SECRET_SIDE_PROJECT = SIDE_SECRET;
   process.env.GITHUB_WEBHOOK_SECRET = GLOBAL_SECRET;
 });
 
 after(() => {
   delete process.env.WEBHOOK_SECRET_MAIN_APP;
+  delete process.env.WEBHOOK_SECRET_SIDE_PROJECT;
   delete process.env.GITHUB_WEBHOOK_SECRET;
 });
 
@@ -127,7 +130,7 @@ describe('shared instance', () => {
     assert.equal(missing.status, 401);
   });
 
-  test('a correctly signed but unregistered repo is acknowledged, not queued', async () => {
+  test('an unregistered repo is acknowledged, not queued', async () => {
     const res = await srv.deliver('issues.labeled.json', {
       delivery: 'd-unknown',
       secret: GLOBAL_SECRET,
@@ -229,7 +232,7 @@ describe('isolated instance (PROJECT_SLUG=side-project)', () => {
   });
 
   test('a repo belonging to another project is refused even though it is in the same config', async () => {
-    const res = await srv.deliver('issues.labeled.json', { delivery: 'd-other', secret: GLOBAL_SECRET });
+    const res = await srv.deliver('issues.labeled.json', { delivery: 'd-other', secret: MAIN_SECRET });
     assert.equal(res.status, 202);
     assert.equal((await res.json()).reason, 'unregistered repository');
   });
@@ -237,7 +240,7 @@ describe('isolated instance (PROJECT_SLUG=side-project)', () => {
   test('its own repo is queued and polling ignores a mismatched slug from the caller', async () => {
     const res = await srv.deliver('issues.labeled.json', {
       delivery: 'd-side',
-      secret: GLOBAL_SECRET,
+      secret: SIDE_SECRET,
       mutate: (payload) => {
         payload.repository.full_name = 'personal/side-project';
         return payload;

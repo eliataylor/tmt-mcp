@@ -966,10 +966,14 @@ describe('secrets file', () => {
     assert.throws(() => writeSecrets(dirFor(21), { AGENT_POLL_SECRET: 'x' }), /AGENT_POLL_SECRET/);
   });
 
-  test('refuses the webhook secret', () => {
+  test('refuses webhook secrets', () => {
     assert.throws(
       () => writeSecrets(dirFor(22), { GITHUB_WEBHOOK_SECRET: 'x' }),
       /GITHUB_WEBHOOK_SECRET/
+    );
+    assert.throws(
+      () => writeSecrets(dirFor(22), { WEBHOOK_SECRET_MAIN_APP: 'x' }),
+      /WEBHOOK_SECRET_MAIN_APP/
     );
   });
 

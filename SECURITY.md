@@ -57,7 +57,7 @@ Three credentials are deliberately split:
 
 | Secret | Where it lives | What it authorizes |
 | --- | --- | --- |
-| Webhook secret (`GITHUB_WEBHOOK_SECRET` or `WEBHOOK_SECRET_*`) | Queue container | Enqueue a task for the repos that share that secret |
+| Webhook secret (`WEBHOOK_SECRET_*`, one per repository) | Queue container | Enqueue a task for that one repository |
 | `AGENT_POLL_SECRET` | Queue container and the orchestrator | Lease, complete, fail, inspect, and replay deliveries |
 | `GITHUB_TOKEN`, `CURSOR_API_KEY`, `NEON_API_KEY`, `POSTHOG_MCP_API_KEY` | Orchestrator host (env file or Keychain) | GitHub writes, the agent, Neon control plane, PostHog |
 
@@ -77,15 +77,16 @@ hostname.
 
 Signature verification uses the raw request bytes and `X-Hub-Signature-256`. The repository
 name in the body is only a hint for which secret to try; a delivery is queued only after the
-HMAC matches. Comparison is constant-time. A declared `webhook_secret_env` that is unset fails
-closed instead of falling back to the global secret. A signed delivery for a repo that is not
-in `config/projects.json` is acknowledged and dropped. `X-GitHub-Delivery` is the dedup key, so
-a GitHub retry does not open a second task.
+HMAC matches. Comparison is constant-time. Every project names its own `webhook_secret_env`,
+and an unset variable fails closed. There is no shared secret. A delivery for a repo that is
+not in `config/projects.json` is acknowledged and dropped before the HMAC, because no secret
+is on file to check; the body is not stored. `X-GitHub-Delivery` is the dedup key, so a GitHub
+retry does not open a second task.
 
 Who may enqueue is decided in `src/triggers.mjs` from fields GitHub signed:
 
 - Comments and newly opened issues require `author_association` of `OWNER`, `MEMBER`, or
-  `COLLABORATOR`, or a login listed in `trusted_logins`.
+  `COLLABORATOR`.
 - Label and assign events are accepted when GitHub delivered them for someone who can edit the
   issue. A sender association of `NONE` is still rejected. A missing association is accepted,
   because GitHub only emits those events for users who can already edit.
@@ -100,7 +101,7 @@ scanner from writing to the queue.
 Source IP is a second check, not a substitute. In the default `enforce` mode the webhook app
 rejects deliveries whose `CF-Connecting-IP` (the tunnel is the one that sets it) is outside
 GitHub's published `hooks` ranges. Until those ranges have loaded, the check is skipped and the
-HMAC stands alone. `WEBHOOK_IP_CHECK=warn` and `=off` weaken or remove it.
+HMAC stands alone until the list has loaded. The check cannot be set to warn or off.
 
 ### Control plane
 
@@ -227,7 +228,7 @@ a long-lived secret on the host.
 Fencing and the canary reduce the chance that a model echoes its prompt into a plan comment.
 They do not stop a model that treats an issue body, a later comment, or a file in the checkout
 as instructions. Write access on the repository is enough to put that text in front of a run:
-a collaborator, or anyone in `trusted_logins`, can enqueue, and execute mode's job is to edit
+a collaborator can enqueue, and execute mode's job is to edit
 the tree and push.
 
 What that run can reveal is whatever the container can already read: `CURSOR_API_KEY`, the
@@ -265,10 +266,10 @@ path checks apply to intercepted HTTP, not to every TCP connection the grant can
 
 ### The source-IP check is skippable
 
-While `api.github.com/meta` has not loaded, or when `WEBHOOK_IP_CHECK` is `warn` or `off`, a
-delivery that presents a valid HMAC is queued from any address. Treat the webhook secret as
-the admission control, and keep one secret per repository (`webhook_secret_env`) so a single
-GitHub webhook setting cannot mint tasks for every tenant.
+While `api.github.com/meta` has not loaded, a delivery that presents a valid HMAC is queued
+from any address. Once the ranges have loaded, addresses outside them are rejected. Each
+repository has its own `webhook_secret_env`, so one GitHub webhook setting cannot mint tasks
+for every tenant.
 
 ### Running the server outside Compose
 
@@ -293,10 +294,6 @@ into the queue.
 
 | Choice | Effect |
 | --- | --- |
-| `ALLOW_UNKNOWN_REPOS=true` | A signed delivery for a repo that is not listed is queued under a slug derived from the name, using the global webhook secret and no `trusted_logins`. Off by default. |
-| One global `GITHUB_WEBHOOK_SECRET` | Any repo configured with that secret can produce a valid signature for this server. Per-repo `webhook_secret_env` avoids that. |
-| `trusted_logins` | Those accounts can enqueue even when GitHub says they are not a write collaborator. |
-| `WEBHOOK_IP_CHECK=off` | HMAC only. |
 | Broad `GITHUB_TOKEN` scopes | The proxy will exercise them on the granted repo. Prefer a fine-grained PAT or an App. |
 | `SECRETS_FROM_KEYCHAIN` unset | Secrets live in `.env.orchestrator`. That file should be mode `0600`. Anything running as you can read it; `~/Developer` is not a TCC-protected directory. Keychain ACLs prompt per binary. |
 | `posthog.read_only: false` | The runner's PostHog session may create and update, not only query. |
@@ -307,7 +304,7 @@ into the queue.
 
 - The public process serves the webhook and nothing else.
 - Queue writes require a GitHub signature, except the bearer-gated ingest route.
-- Unknown repos are dropped unless an operator opts in.
+- Unknown repos are dropped. Each repository has its own webhook secret. Only write collaborators can enqueue. Source IPs outside GitHub's hooks ranges are rejected once those ranges have loaded.
 - The runner network cannot route to the queue, and the filter rejects the gateway, private
   ranges, and the VM.
 - The GitHub token is not in the runner, not in remote URLs, and not in `docker inspect`.

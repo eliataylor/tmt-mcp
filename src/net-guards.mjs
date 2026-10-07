@@ -70,11 +70,11 @@ export function controlPlaneGuard(options) {
 /**
  * Middleware asserting a webhook delivery came from a GitHub hooks range.
  *
- * `mode` is 'enforce' or 'warn'. When the ranges have not loaded yet the request is allowed
- * through with a warning, so a network hiccup at startup cannot silently drop every delivery
- * while the HMAC is still doing the real work.
+ * When the ranges have not loaded yet the request is allowed through with a warning, so a
+ * network hiccup at startup cannot silently drop every delivery while the HMAC is still doing
+ * the real work. A loaded list always rejects addresses outside it.
  */
-export function githubSourceGuard(meta, { mode = 'enforce', logger = console } = {}) {
+export function githubSourceGuard(meta, { logger = console } = {}) {
   return function guard(req, res, next) {
     const claimed = req.headers['cf-connecting-ip'] || req.socket?.remoteAddress;
     const verdict = meta.contains(claimed);
@@ -87,10 +87,6 @@ export function githubSourceGuard(meta, { mode = 'enforce', logger = console } =
     }
     if (verdict) return next();
 
-    if (mode === 'warn') {
-      logger.warn?.(`[Webhook] source ${claimed} is outside GitHub hooks ranges (warn mode)`);
-      return next();
-    }
     logger.warn?.(`[Webhook] rejected delivery from ${claimed}: outside GitHub hooks ranges`);
     return res.status(403).json({ error: 'Forbidden' });
   };

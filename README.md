@@ -21,7 +21,7 @@ Herdr panes) is the consumer and lives outside this repo.
 
 ```bash
 cp .env.example .env                       # then fill in the secrets
-openssl rand -hex 32                       # one for GITHUB_WEBHOOK_SECRET, one for AGENT_POLL_SECRET
+openssl rand -hex 32                       # one per repository webhook secret, plus AGENT_POLL_SECRET
 cp config/projects.example.json config/projects.json
 docker compose -f docker-compose.dev.yml up -d --build
 docker compose -f docker-compose.dev.yml logs -f webhook-server
@@ -74,21 +74,18 @@ where each issue's plan is committed as `PLAN-<issue>.md`. It must be a relative
 repository and must not be gitignored there — the orchestrator refuses to scaffold into an ignored
 folder, because every plan commit would come out empty.
 
-`trusted_logins` is optional. Comments and newly opened issues enqueue only when the actor's
-`author_association` is `OWNER`, `MEMBER`, or `COLLABORATOR`, or their login is in that list.
-Someone without write access cannot start a run by commenting on an issue that already carries
-`agent:execute`. Label and assign events are different: GitHub only delivers those for users who
-can already edit the issue, so a missing association is accepted. An association of `NONE` on the
-sender is still rejected.
+Comments and newly opened issues enqueue only when the actor's `author_association` is
+`OWNER`, `MEMBER`, or `COLLABORATOR`. Someone without write access cannot start a run by
+commenting on an issue that already carries `agent:execute`. Label and assign events are
+different: GitHub only delivers those for users who can already edit the issue, so a missing
+association is accepted. An association of `NONE` on the sender is still rejected.
 
-`webhook_secret_env` is optional; without it the project uses `GITHUB_WEBHOOK_SECRET`. With
-it, that repo's deliveries are verified against its own secret, so one tenant's webhook
-secret cannot be used to post as another. A declared-but-unset variable fails closed rather
-than quietly falling back to the global secret.
+`webhook_secret_env` is required, and each repository names a different variable. Deliveries
+are verified against that secret only. There is no shared `GITHUB_WEBHOOK_SECRET`. An unset
+variable fails closed.
 
-A signed delivery from a repo that is not listed is acknowledged with 202 and logged, never
-queued. Set `ALLOW_UNKNOWN_REPOS=true` to accept them under a slug derived from the repo
-name instead.
+A delivery from a repo that is not listed is acknowledged with 202 and logged, never queued.
+That is not configurable.
 
 ### What becomes a task
 
@@ -311,9 +308,9 @@ CLI satisfies all three for free ([`src/net-guards.mjs`](src/net-guards.mjs)):
 - no `Origin` header at all, since a CLI never sends one
 - no `Sec-Fetch-Site` or `Sec-Fetch-Mode`, which browsers set and page JavaScript cannot strip
 
-Webhook deliveries are additionally checked against the `hooks` CIDRs from
-`api.github.com/meta`, read from `CF-Connecting-IP`. That is defense in depth behind the HMAC,
-and a failure to load the ranges logs and skips rather than dropping every delivery.
+Webhook deliveries are checked against the `hooks` CIDRs from `api.github.com/meta`, read
+from `CF-Connecting-IP`. That check is always enforced. A failure to load the ranges logs and
+skips until the next refresh, rather than dropping every delivery while the list is unknown.
 
 A claimed task is leased for `LEASE_SECONDS`. If the orchestrator dies, the reaper returns
 the task to `pending` (or `failed` once attempts are spent) rather than leaving it stuck in
@@ -330,7 +327,7 @@ uses `github_issue_id` for both — use `github_issue_number` there instead.
 
 One shared instance serves every repo in the registry, and that is the default. Running one
 stack per project is supported but rarely necessary: the queue container holds only
-`GITHUB_WEBHOOK_SECRET` and `AGENT_POLL_SECRET`, while the credentials actually worth
+the per-repository webhook secrets and `AGENT_POLL_SECRET`, while the credentials actually worth
 isolating (the PAT, the Neon key, the blob token, the ephemeral `DATABASE_URL`) live in the
 orchestrator and in each worktree's `.env.local`. Cross-project concurrency already happens
 at the agent-runner layer, which spawns a container per issue.
@@ -515,8 +512,7 @@ not cross the macOS VM boundary reliably. Host-side reads can be stale or hit lo
 
 | Variable | Purpose |
 | --- | --- |
-| `GITHUB_WEBHOOK_SECRET` | Fallback HMAC secret for projects without their own |
-| `WEBHOOK_SECRET_*` | Per-project secret, named by `webhook_secret_env` |
+| `WEBHOOK_SECRET_*` | HMAC secret for one repository, named by that project's `webhook_secret_env` |
 | `AGENT_POLL_SECRET` | Bearer token for the orchestrator endpoints |
 | `PROJECTS_CONFIG` | Registry path, default `/config/projects.json` |
 | `PROJECT_SLUG` | Isolated mode only; pins the instance to one project |
@@ -525,8 +521,6 @@ not cross the macOS VM boundary reliably. Host-side reads can be stale or hit lo
 | `CONTROL_HOST_PORT`, `DATA_DIR` | Compose-only: published loopback port and data subdirectory |
 | `CONTROL_ALLOWED_HOSTS` | Accepted `Host` values on the control listener |
 | `CONTROL_REQUIRE_LOOPBACK_PEER` | Also require a loopback peer IP; off by default because Docker Desktop rewrites it to the gateway |
-| `WEBHOOK_IP_CHECK` | Verify delivery source IPs against `api.github.com/meta`, default `true` |
-| `ALLOW_UNKNOWN_REPOS` | Accept repos absent from the registry, default `false` |
 | `LEASE_SECONDS`, `MAX_ATTEMPTS`, `RETRY_BACKOFF_SECONDS`, `REAPER_INTERVAL_SECONDS` | Queue behaviour |
 | `TUNNEL_METRICS_URL` | cloudflared metrics endpoint used to log the webhook URL |
 

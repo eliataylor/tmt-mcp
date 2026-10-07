@@ -68,7 +68,7 @@ const payload = JSON.parse(readFileSync(fixturePath, 'utf8'));
 process.env.DRY_RUN = 'true';
 const config = loadConfig();
 
-const registry = loadRegistry({ allowUnknownRepos: true });
+const registry = loadRegistry();
 const repoFullName = payload.repository?.full_name;
 const registryEntry = registry.byRepo(repoFullName);
 

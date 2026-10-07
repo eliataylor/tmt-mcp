@@ -3,7 +3,7 @@ import express from 'express';
 import { pathToFileURL } from 'node:url';
 
 import { openDatabase, databaseInfo, DEFAULT_DB_PATH } from './db.mjs';
-import { loadRegistry } from './projects.mjs';
+import { assertKnownReposOnly, loadRegistry } from './projects.mjs';
 import { peekRepoFullName, requireBearer, resolveWebhookSecret, verifySignature } from './auth.mjs';
 import { handleDelivery } from './delivery.mjs';
 import * as queue from './queue.mjs';
@@ -11,7 +11,23 @@ import { announceWebhookUrl } from './tunnel.mjs';
 import { controlPlaneGuard, githubSourceGuard } from './net-guards.mjs';
 import { createGithubMeta } from './github-meta.mjs';
 
+/**
+ * Source-IP verification is always on. `warn`, `off`, and `false` used to weaken it; a public
+ * repo must not grow that switch back, so those values refuse to boot.
+ */
+export function assertWebhookIpCheckEnforced(env = process.env) {
+  const raw = env.WEBHOOK_IP_CHECK;
+  if (raw === undefined || raw === '') return;
+  const normalized = String(raw).toLowerCase();
+  if (normalized === 'enforce' || normalized === 'true' || normalized === '1') return;
+  throw new Error(
+    `WEBHOOK_IP_CHECK=${raw} is not supported. Deliveries from outside GitHub's hooks ranges are always rejected.`
+  );
+}
+
 export function loadConfig(env = process.env) {
+  assertKnownReposOnly(env);
+  assertWebhookIpCheckEnforced(env);
   const controlPort = Number(env.CONTROL_PORT || 3001);
   return {
     port: Number(env.PORT || 3000),
@@ -26,12 +42,6 @@ export function loadConfig(env = process.env) {
       .map((h) => h.trim())
       .filter(Boolean),
     controlRequireLoopbackPeer: env.CONTROL_REQUIRE_LOOPBACK_PEER === 'true',
-    // 'enforce' (default) | 'warn' | 'off'. 'off' also skips the /meta fetch entirely.
-    webhookIpCheck: ['warn', 'off', 'false'].includes(env.WEBHOOK_IP_CHECK)
-      ? env.WEBHOOK_IP_CHECK === 'false'
-        ? 'off'
-        : env.WEBHOOK_IP_CHECK
-      : 'enforce',
     dbPath: env.DB_PATH || DEFAULT_DB_PATH,
     pollSecret: env.AGENT_POLL_SECRET || '',
     leaseSeconds: Number(env.LEASE_SECONDS || 1800),
@@ -83,10 +93,18 @@ function mountWebhookRoutes(app, { db, registry, config, log }) {
       return res.status(400).json({ error: 'Missing request body' });
     }
 
-    // Peek at the repo only to choose which secret to check against. Nothing from the
-    // payload is acted on until the signature verifies below.
+    // Peek at the repo only to choose which secret to check against. An unregistered name has
+    // no secret on file, so it is dropped before the HMAC: nothing is queued either way.
     const repoFullName = peekRepoFullName(rawBody);
     const project = registry.byRepo(repoFullName);
+    if (!project) {
+      log.warn(
+        `Unregistered repository "${repoFullName || '(missing)'}". Add it to ${registry.configPath}` +
+          (registry.scopedSlug ? ` (this instance is pinned to "${registry.scopedSlug}")` : '')
+      );
+      return res.status(202).json({ ok: true, ignored: true, reason: 'unregistered repository' });
+    }
+
     const { secret, source, missing } = resolveWebhookSecret(project);
 
     if (missing || !secret) {
@@ -100,17 +118,7 @@ function mountWebhookRoutes(app, { db, registry, config, log }) {
     }
 
     if (event === 'ping') {
-      return res.json({ ok: true, pong: true, project_slug: project?.slug ?? null });
-    }
-
-    if (!project) {
-      // Signed correctly but the repo is not in the registry. Ack so GitHub stops, and log
-      // it loudly because it is almost always a missing projects.json entry.
-      log.warn(
-        `Unregistered repository "${repoFullName}". Add it to ${registry.configPath}` +
-          (registry.scopedSlug ? ` (this instance is pinned to "${registry.scopedSlug}")` : '')
-      );
-      return res.status(202).json({ ok: true, ignored: true, reason: 'unregistered repository' });
+      return res.json({ ok: true, pong: true, project_slug: project.slug });
     }
 
     const result = handleDelivery({
@@ -239,8 +247,6 @@ function mountControlRoutes(app, { db, registry, config, log }) {
       mode: registry.scopedSlug ? 'isolated' : 'shared',
       project_slug: registry.scopedSlug,
       projects: registry.slugs(),
-      allow_unknown_repos: registry.allowUnknownRepos,
-      registry_error: registry.loadError ? registry.loadError.message : null,
       tasks: queue.statusCounts(db),
     });
   });
@@ -272,8 +278,8 @@ function mountFallbacks(app, log) {
  */
 export function createWebhookApp({ db, registry, config, log = createLogger('Webhook'), meta = null }) {
   const app = baseApp('10mb');
-  if (meta && config.webhookIpCheck !== 'off') {
-    app.use(githubSourceGuard(meta, { mode: config.webhookIpCheck, logger: log }));
+  if (meta) {
+    app.use(githubSourceGuard(meta, { logger: log }));
   }
   mountWebhookRoutes(app, { db, registry, config, log });
   return mountFallbacks(app, log);
@@ -352,22 +358,16 @@ export async function main() {
   );
 
   // Source-IP verification is defense in depth behind the HMAC. A failure to load the ranges is
-  // logged and skipped rather than dropping every delivery.
-  let meta = null;
-  let metaRefresher = null;
-  if (config.webhookIpCheck === 'off') {
-    log.info('Source-IP verification disabled (WEBHOOK_IP_CHECK); HMAC only');
-  } else {
-    meta = createGithubMeta();
-    const metaResult = await meta.refresh();
-    log.info(
-      metaResult.ok
-        ? `Loaded ${metaResult.count} GitHub hooks CIDR range(s)`
-        : `Could not load GitHub hooks ranges (${metaResult.error.message}); source-IP checks skipped`
-    );
-    metaRefresher = setInterval(() => meta.refresh(), 6 * 60 * 60 * 1000);
-    metaRefresher.unref();
-  }
+  // logged and skipped rather than dropping every delivery. The check itself cannot be disabled.
+  const meta = createGithubMeta();
+  const metaResult = await meta.refresh();
+  log.info(
+    metaResult.ok
+      ? `Loaded ${metaResult.count} GitHub hooks CIDR range(s)`
+      : `Could not load GitHub hooks ranges (${metaResult.error.message}); source-IP checks skipped until they load`
+  );
+  const metaRefresher = setInterval(() => meta.refresh(), 6 * 60 * 60 * 1000);
+  metaRefresher.unref();
 
   const webhookApp = createWebhookApp({ db, registry, config, log: createLogger('Webhook'), meta });
   const controlApp = createControlApp({ db, registry, config, log: createLogger('Control') });
@@ -389,7 +389,7 @@ export async function main() {
   process.on('SIGHUP', () => {
     try {
       const result = registry.reload();
-      log.info(`Reloaded registry: ${result.ok ? `${result.count} project(s)` : result.error.message}`);
+      log.info(`Reloaded registry: ${result.count} project(s)`);
     } catch (err) {
       log.error(`Registry reload failed, keeping previous config: ${err.message}`);
     }

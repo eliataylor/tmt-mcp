@@ -115,7 +115,7 @@ describe('listener split', () => {
 
   test('the tunnel-facing app serves the webhook and nothing else', async () => {
     const db = openDatabase(':memory:');
-    const registry = loadRegistry({ configPath: CONFIG_PATH, allowUnknownRepos: false });
+    const registry = loadRegistry({ configPath: CONFIG_PATH });
     const config = { ...loadConfig({}), pollSecret: 'poll-secret' };
     const app = createWebhookApp({ db, registry, config, log: silent });
     const { server, base } = await boot(app);
@@ -144,7 +144,7 @@ describe('listener split', () => {
 
   test('the control app serves the orchestrator endpoints and rejects browser-shaped requests', async () => {
     const db = openDatabase(':memory:');
-    const registry = loadRegistry({ configPath: CONFIG_PATH, allowUnknownRepos: false });
+    const registry = loadRegistry({ configPath: CONFIG_PATH });
     const app = createControlApp({
       db,
       registry,
@@ -201,7 +201,7 @@ describe('listener split', () => {
 
   test('the webhook route still requires a valid signature', async () => {
     const db = openDatabase(':memory:');
-    const registry = loadRegistry({ configPath: CONFIG_PATH, allowUnknownRepos: false });
+    const registry = loadRegistry({ configPath: CONFIG_PATH });
     // main-app declares webhook_secret_env, so without this the secret check 503s before the
     // signature is ever examined.
     process.env.WEBHOOK_SECRET_MAIN_APP = 'scoped-secret-for-main-app';
@@ -230,10 +230,9 @@ describe('listener split', () => {
     }
   });
 
-  test('WEBHOOK_IP_CHECK=off skips the source guard entirely', async () => {
+  test('a source outside GitHub hooks ranges is rejected', async () => {
     const db = openDatabase(':memory:');
-    const registry = loadRegistry({ configPath: CONFIG_PATH, allowUnknownRepos: false });
-    // A meta that would reject every address; 'off' must mean the guard is never mounted.
+    const registry = loadRegistry({ configPath: CONFIG_PATH });
     const meta = createGithubMeta({
       fetchImpl: async () => ({ ok: true, json: async () => ({ hooks: ['10.9.9.0/24'] }) }),
     });
@@ -241,7 +240,7 @@ describe('listener split', () => {
     const app = createWebhookApp({
       db,
       registry,
-      config: { ...loadConfig({}), pollSecret: 'x', webhookIpCheck: 'off' },
+      config: { ...loadConfig({}), pollSecret: 'x' },
       log: silent,
       meta,
     });
@@ -252,20 +251,20 @@ describe('listener split', () => {
         headers: { 'content-type': 'application/json', 'x-github-event': 'issues' },
         body: '{}',
       });
-      // Reaches signature/secret handling rather than being turned away as a bad source IP.
-      assert.notEqual(res.status, 403);
+      assert.equal(res.status, 403);
     } finally {
       server.close();
       db.close();
     }
   });
 
-  test('loadConfig maps WEBHOOK_IP_CHECK values to the three modes', () => {
-    assert.equal(loadConfig({}).webhookIpCheck, 'enforce');
-    assert.equal(loadConfig({ WEBHOOK_IP_CHECK: 'true' }).webhookIpCheck, 'enforce');
-    assert.equal(loadConfig({ WEBHOOK_IP_CHECK: 'warn' }).webhookIpCheck, 'warn');
-    assert.equal(loadConfig({ WEBHOOK_IP_CHECK: 'off' }).webhookIpCheck, 'off');
-    assert.equal(loadConfig({ WEBHOOK_IP_CHECK: 'false' }).webhookIpCheck, 'off');
+  test('WEBHOOK_IP_CHECK cannot be turned off', () => {
+    assert.doesNotThrow(() => loadConfig({}));
+    assert.doesNotThrow(() => loadConfig({ WEBHOOK_IP_CHECK: 'enforce' }));
+    assert.doesNotThrow(() => loadConfig({ WEBHOOK_IP_CHECK: 'true' }));
+    assert.throws(() => loadConfig({ WEBHOOK_IP_CHECK: 'warn' }), /WEBHOOK_IP_CHECK=warn is not supported/);
+    assert.throws(() => loadConfig({ WEBHOOK_IP_CHECK: 'off' }), /WEBHOOK_IP_CHECK=off is not supported/);
+    assert.throws(() => loadConfig({ WEBHOOK_IP_CHECK: 'false' }), /WEBHOOK_IP_CHECK=false is not supported/);
   });
 });
 

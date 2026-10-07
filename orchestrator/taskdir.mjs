@@ -17,8 +17,12 @@ import { assertEnvLocalIgnored } from './repo.mjs';
  * Docker socket could read them. A mount shows only the path.
  */
 
-/** Never allowed into a runner: org-scoped and able to delete entire Neon projects. */
+/** Never allowed into a runner. Webhook secrets stay on the queue; the Neon key can delete projects. */
 const FORBIDDEN_SECRET_KEYS = ['NEON_API_KEY', 'AGENT_POLL_SECRET', 'GITHUB_WEBHOOK_SECRET'];
+
+function isForbiddenSecretKey(key) {
+  return FORBIDDEN_SECRET_KEYS.includes(key) || key.startsWith('WEBHOOK_SECRET');
+}
 
 export function taskDirFor(tasksDir, slug, issueNumber, taskId) {
   return join(tasksDir, `${slug}-issue-${issueNumber}-${String(taskId).slice(0, 8)}`);
@@ -60,7 +64,7 @@ export function writePrompt(paths, prompt) {
  */
 export function writeSecrets(paths, secrets) {
   const keys = Object.keys(secrets);
-  const leaked = keys.filter((k) => FORBIDDEN_SECRET_KEYS.includes(k));
+  const leaked = keys.filter(isForbiddenSecretKey);
   if (leaked.length) {
     throw new Error(
       `Refusing to pass ${leaked.join(', ')} into a runner container. The runner needs no queue ` +

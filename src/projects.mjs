@@ -32,14 +32,32 @@ export function normalizePlanFolder(value, where = 'plan_folder') {
   return segments.join('/');
 }
 
-function envFlag(name, fallback = false) {
-  const raw = process.env[name];
-  if (raw === undefined || raw === '') return fallback;
-  return raw === '1' || raw.toLowerCase() === 'true';
+/**
+ * Unknown repositories are never admitted. The env var used to opt into that, and a public
+ * repo must not grow the switch back: a truthy value refuses to boot instead of being ignored.
+ */
+export function assertKnownReposOnly(env = process.env) {
+  const raw = env.ALLOW_UNKNOWN_REPOS;
+  if (raw === undefined || raw === '') return;
+  const normalized = String(raw).toLowerCase();
+  if (normalized === 'false' || normalized === '0') return;
+  throw new Error(
+    `ALLOW_UNKNOWN_REPOS=${raw} is not supported. Repositories absent from the registry are always dropped.`
+  );
 }
 
-function slugifyRepo(fullName) {
-  return fullName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+function normalizeWebhookSecretEnv(value, where) {
+  if (typeof value !== 'string' || !/^[A-Z][A-Z0-9_]*$/.test(value)) {
+    throw new Error(
+      `${where} "webhook_secret_env" is required and must name an environment variable, e.g. WEBHOOK_SECRET_MAIN_APP`
+    );
+  }
+  if (value === 'GITHUB_WEBHOOK_SECRET') {
+    throw new Error(
+      `${where} "webhook_secret_env" must be a per-repository variable, not GITHUB_WEBHOOK_SECRET`
+    );
+  }
+  return value;
 }
 
 function normalizeProject(raw, index) {
@@ -49,6 +67,11 @@ function normalizeProject(raw, index) {
   if (!raw.repo) throw new Error(`${where} (${raw.slug}) is missing "repo"`);
   if (!raw.repo.includes('/')) {
     throw new Error(`${where} (${raw.slug}) "repo" must be "owner/name", got "${raw.repo}"`);
+  }
+  if (raw.trusted_logins !== undefined) {
+    throw new Error(
+      `${where} (${raw.slug}) "trusted_logins" is not supported. Only GitHub write collaborators can enqueue.`
+    );
   }
 
   return {
@@ -63,22 +86,8 @@ function normalizeProject(raw, index) {
     mention: raw.mention || DEFAULTS.mention,
     plan_folder: normalizePlanFolder(raw.plan_folder, `${where} (${raw.slug}) "plan_folder"`),
     agent_login: raw.agent_login || null,
-    webhook_secret_env: raw.webhook_secret_env || null,
-    trusted_logins: normalizeTrustedLogins(raw.trusted_logins, `${where} (${raw.slug})`),
+    webhook_secret_env: normalizeWebhookSecretEnv(raw.webhook_secret_env, `${where} (${raw.slug})`),
   };
-}
-
-function normalizeTrustedLogins(value, where) {
-  if (value === undefined || value === null) return [];
-  if (!Array.isArray(value)) {
-    throw new Error(`${where} "trusted_logins" must be an array of GitHub logins`);
-  }
-  return value.map((login, index) => {
-    if (typeof login !== 'string' || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(login)) {
-      throw new Error(`${where} trusted_logins[${index}] is not a GitHub login`);
-    }
-    return login;
-  });
 }
 
 function parseRegistry(json) {
@@ -91,11 +100,18 @@ function parseRegistry(json) {
 
   const seenSlugs = new Set();
   const seenRepos = new Set();
+  const seenSecrets = new Set();
   for (const p of projects) {
     if (seenSlugs.has(p.slug)) throw new Error(`duplicate project slug "${p.slug}"`);
     if (seenRepos.has(p.repo_key)) throw new Error(`duplicate repo "${p.repo}"`);
+    if (seenSecrets.has(p.webhook_secret_env)) {
+      throw new Error(
+        `duplicate webhook_secret_env "${p.webhook_secret_env}". Each repository needs its own secret.`
+      );
+    }
     seenSlugs.add(p.slug);
     seenRepos.add(p.repo_key);
+    seenSecrets.add(p.webhook_secret_env);
   }
 
   return projects;
@@ -111,10 +127,11 @@ function parseRegistry(json) {
 export function loadRegistry({
   configPath = process.env.PROJECTS_CONFIG || './config/projects.json',
   projectSlug = process.env.PROJECT_SLUG || null,
-  allowUnknownRepos = envFlag('ALLOW_UNKNOWN_REPOS', false),
+  env = process.env,
 } = {}) {
+  assertKnownReposOnly(env);
+
   let projects = [];
-  let loadError = null;
 
   function read() {
     let text;
@@ -124,7 +141,7 @@ export function loadRegistry({
       if (err.code === 'ENOENT') {
         throw new Error(
           `projects config not found at ${configPath}. ` +
-            'Copy config/projects.example.json to config/projects.json, or set ALLOW_UNKNOWN_REPOS=true to run without a registry.'
+            'Copy config/projects.example.json to config/projects.json and set each project\'s webhook_secret_env.'
         );
       }
       throw err;
@@ -145,19 +162,7 @@ export function loadRegistry({
   }
 
   function reload() {
-    try {
-      projects = read();
-      loadError = null;
-    } catch (err) {
-      // With ALLOW_UNKNOWN_REPOS the registry is optional, so a missing or broken file
-      // degrades to an empty registry instead of refusing to boot.
-      if (allowUnknownRepos) {
-        projects = [];
-        loadError = err;
-        return { ok: false, error: err };
-      }
-      throw err;
-    }
+    projects = read();
     return { ok: true, count: projects.length };
   }
 
@@ -166,38 +171,19 @@ export function loadRegistry({
   return {
     configPath,
     scopedSlug: projectSlug,
-    allowUnknownRepos,
     reload,
-    get loadError() {
-      return loadError;
-    },
     list: () => projects.slice(),
     slugs: () => projects.map((p) => p.slug),
     bySlug: (slug) => projects.find((p) => p.slug === slug) || null,
 
     /**
      * Resolve a repository full_name to its project.
-     * Returns null when the repo is not registered and unknown repos are not allowed —
-     * the caller turns that into a rejected delivery rather than a "default-project" row.
+     * Returns null when the repo is not registered. The caller drops that delivery.
      */
     byRepo(fullName) {
       if (!fullName) return null;
       const key = String(fullName).toLowerCase();
-      const match = projects.find((p) => p.repo_key === key);
-      if (match) return match;
-      if (!allowUnknownRepos) return null;
-      // PROJECT_SLUG pins this instance to one project; never synthesize past it.
-      if (projectSlug) return null;
-      return {
-        ...DEFAULTS,
-        slug: slugifyRepo(fullName),
-        repo: fullName,
-        repo_key: key,
-        agent_login: null,
-        webhook_secret_env: null,
-        trusted_logins: [],
-        synthesized: true,
-      };
+      return projects.find((p) => p.repo_key === key) || null;
     },
   };
 }

@@ -14,7 +14,8 @@
       "repo": "personal/side-project",
       "default_branch": "main",
       "trigger_label": "agent:assigned",
-      "mention": "@dev-agent"
+      "mention": "@dev-agent",
+      "webhook_secret_env": "WEBHOOK_SECRET_SIDE_PROJECT"
     }
   ]
 }

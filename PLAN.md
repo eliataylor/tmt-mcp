@@ -95,13 +95,13 @@ const REPO_PROJECT_MAP = {
   'personal/side-project': 'side-project'
 };
 
-const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || 'local_dev_webhook_secret_123';
+const WEBHOOK_SECRET_MAIN_APP = process.env.WEBHOOK_SECRET_MAIN_APP;
 const AGENT_POLL_SECRET = process.env.AGENT_POLL_SECRET || 'local_dev_poll_secret_456';
 
 function verifyGitHubSignature(req) {
   const signature = req.headers['x-hub-signature-256'];
   if (!signature) return false;
-  const hmac = crypto.createHmac('sha256', GITHUB_WEBHOOK_SECRET);
+  const hmac = crypto.createHmac('sha256', WEBHOOK_SECRET_MAIN_APP);
   const digest = `sha256=${hmac.update(JSON.stringify(req.body)).digest('hex')}`;
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
 }
@@ -115,7 +115,10 @@ app.post('/api/agent/webhook', (req, res) => {
   const event = req.headers['x-github-event'];
   const payload = req.body;
   const repoFullName = payload.repository?.full_name;
-  const projectSlug = REPO_PROJECT_MAP[repoFullName] || repoFullName || 'default-project';
+  const projectSlug = REPO_PROJECT_MAP[repoFullName];
+  if (!projectSlug) {
+    return res.status(202).json({ success: true, ignored: true, reason: 'unregistered repository' });
+  }
 
   let shouldQueue = false;
   let actionType = 'unknown';
@@ -241,7 +244,7 @@ services:
       dockerfile: Dockerfile.server
     container_name: agent-webhook-server
     environment:
-      GITHUB_WEBHOOK_SECRET: "local_dev_webhook_secret_123"
+      WEBHOOK_SECRET_MAIN_APP: "local_dev_webhook_secret_123"
       AGENT_POLL_SECRET: "local_dev_poll_secret_456"
     ports:
       - "3000:3000"

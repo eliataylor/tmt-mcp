@@ -67,26 +67,28 @@ describe('safeEqual', () => {
 });
 
 describe('resolveWebhookSecret', () => {
-  test('prefers the per-project variable', () => {
+  test('reads the per-project variable', () => {
     const env = { GITHUB_WEBHOOK_SECRET: 'global', WEBHOOK_SECRET_MAIN_APP: 'scoped' };
     const result = resolveWebhookSecret({ webhook_secret_env: 'WEBHOOK_SECRET_MAIN_APP' }, env);
     assert.deepEqual(result, { secret: 'scoped', source: 'WEBHOOK_SECRET_MAIN_APP' });
   });
 
-  test('falls back to the global secret when the project declares none', () => {
+  test('does not fall back to a global secret', () => {
     const result = resolveWebhookSecret({ webhook_secret_env: null }, { GITHUB_WEBHOOK_SECRET: 'global' });
-    assert.equal(result.secret, 'global');
-    assert.equal(result.missing, false);
+    assert.equal(result.secret, null);
+    assert.equal(result.missing, true);
+    assert.equal(result.source, null);
   });
 
-  test('never silently falls back when a declared variable is unset', () => {
+  test('fails closed when the declared variable is unset', () => {
     const env = { GITHUB_WEBHOOK_SECRET: 'global' };
     const result = resolveWebhookSecret({ webhook_secret_env: 'WEBHOOK_SECRET_MISSING' }, env);
     assert.equal(result.secret, null);
     assert.equal(result.missing, true);
+    assert.equal(result.source, 'WEBHOOK_SECRET_MISSING');
   });
 
-  test('reports a missing global secret', () => {
+  test('reports a project with no secret name', () => {
     assert.equal(resolveWebhookSecret(null, {}).missing, true);
   });
 });

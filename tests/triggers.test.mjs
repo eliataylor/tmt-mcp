@@ -234,13 +234,12 @@ describe('non-triggers', () => {
     assert.equal(classify({ event: 'issue_comment', payload, project: PROJECT }).kind, 'ignore');
   });
 
-  test('a trusted login may comment without a write association', () => {
+  test('a login without a write association does not enqueue', () => {
     const payload = commented();
     payload.comment.author_association = 'NONE';
     payload.comment.user = { login: 'outside-helper', type: 'User' };
     payload.comment.body = '@dev-agent please look';
-    const project = { ...PROJECT, trusted_logins: ['Outside-Helper'] };
-    assert.equal(classify({ event: 'issue_comment', payload, project }).action, ACTIONS.ASSIGNED);
+    assert.equal(classify({ event: 'issue_comment', payload, project: PROJECT }).kind, 'ignore');
   });
 
   test('an issue opened by a contributor does not enqueue from a mention', () => {

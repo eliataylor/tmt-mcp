@@ -39,17 +39,15 @@ export function signBody(rawBody, secret) {
 }
 
 /**
- * Pick the webhook secret for a project: its own WEBHOOK_SECRET_* variable when declared,
- * otherwise the global fallback.
+ * The webhook secret for a project is the environment variable named by webhook_secret_env.
+ * There is no shared fallback: a missing name or an unset variable fails closed.
  */
 export function resolveWebhookSecret(project, env = process.env) {
-  if (project?.webhook_secret_env) {
-    const scoped = env[project.webhook_secret_env];
-    if (scoped) return { secret: scoped, source: project.webhook_secret_env };
-    return { secret: null, source: project.webhook_secret_env, missing: true };
-  }
-  const global = env.GITHUB_WEBHOOK_SECRET;
-  return { secret: global || null, source: 'GITHUB_WEBHOOK_SECRET', missing: !global };
+  const name = project?.webhook_secret_env;
+  if (!name) return { secret: null, source: null, missing: true };
+  const scoped = env[name];
+  if (scoped) return { secret: scoped, source: name };
+  return { secret: null, source: name, missing: true };
 }
 
 /**

@@ -16,7 +16,8 @@
 import { readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 
-import { signBody } from '../src/auth.mjs';
+import { peekRepoFullName, signBody } from '../src/auth.mjs';
+import { loadRegistry } from '../src/projects.mjs';
 
 const { values } = parseArgs({
   options: {
@@ -25,7 +26,7 @@ const { values } = parseArgs({
     fixture: { type: 'string', default: 'issues.labeled.json' },
     event: { type: 'string', default: 'issues' },
     delivery: { type: 'string' },
-    secret: { type: 'string', default: process.env.GITHUB_WEBHOOK_SECRET || '' },
+    secret: { type: 'string', default: '' },
     'poll-secret': { type: 'string', default: process.env.AGENT_POLL_SECRET || '' },
     'leave-pending': { type: 'boolean', default: false },
     help: { type: 'boolean', default: false },
@@ -58,8 +59,20 @@ function fail(message) {
   process.exit(1);
 }
 
-if (!values.secret) fail('No webhook secret. Pass --secret or set GITHUB_WEBHOOK_SECRET.');
 if (!pollSecret) fail('No poll secret. Pass --poll-secret or set AGENT_POLL_SECRET.');
+
+const fixtureBody = readFileSync(new URL(`../fixtures/${values.fixture}`, import.meta.url));
+const registry = loadRegistry();
+const project = registry.byRepo(peekRepoFullName(fixtureBody));
+const secret =
+  values.secret || (project?.webhook_secret_env ? process.env[project.webhook_secret_env] : '');
+if (!secret) {
+  fail(
+    project
+      ? `No webhook secret. Pass --secret or set ${project.webhook_secret_env}.`
+      : `No project registered for ${peekRepoFullName(fixtureBody) || 'this fixture'}. Pass --secret only after it is listed.`
+  );
+}
 
 const authHeaders = { authorization: `Bearer ${pollSecret}`, 'content-type': 'application/json' };
 const step = (label, detail) => console.log(`OK    ${label}${detail ? ` — ${detail}` : ''}`);
@@ -80,14 +93,14 @@ const healthBody = await readJson(health);
 step('health', `sqlite ${healthBody.sqlite_version}, ${healthBody.mode} mode, projects: ${healthBody.projects.join(', ') || 'none'}`);
 
 // 2. Signed delivery --------------------------------------------------------
-const body = readFileSync(new URL(`../fixtures/${values.fixture}`, import.meta.url));
+const body = fixtureBody;
 const delivered = await fetch(`${base}/api/agent/webhook`, {
   method: 'POST',
   headers: {
     'content-type': 'application/json',
     'x-github-event': values.event,
     'x-github-delivery': deliveryId,
-    'x-hub-signature-256': signBody(body, values.secret),
+    'x-hub-signature-256': signBody(body, secret),
   },
   body,
 });
@@ -104,7 +117,7 @@ const repeat = await fetch(`${base}/api/agent/webhook`, {
     'content-type': 'application/json',
     'x-github-event': values.event,
     'x-github-delivery': deliveryId,
-    'x-hub-signature-256': signBody(body, values.secret),
+    'x-hub-signature-256': signBody(body, secret),
   },
   body,
 });
