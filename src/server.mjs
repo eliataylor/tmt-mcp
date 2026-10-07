@@ -10,6 +10,8 @@ import * as queue from './queue.mjs';
 import { announceWebhookUrl } from './tunnel.mjs';
 import { controlPlaneGuard, githubSourceGuard } from './net-guards.mjs';
 import { createGithubMeta } from './github-meta.mjs';
+import { notifyAdmin } from './notify.mjs';
+import { pruneTunnelHits, readAccessLog, tunnelAccessMiddleware } from './access-log.mjs';
 
 /**
  * Source-IP verification is always on. `warn`, `off`, and `false` used to weaken it; a public
@@ -90,7 +92,7 @@ function mountWebhookRoutes(app, { db, registry, config, log }) {
     const rawBody = req.rawBody;
 
     if (!Buffer.isBuffer(rawBody)) {
-      return res.status(400).json({ error: 'Missing request body' });
+      return deny(res, 400, { error: 'Missing request body' }, 'missing_body');
     }
 
     // Peek at the repo only to choose which secret to check against. An unregistered name has
@@ -102,21 +104,22 @@ function mountWebhookRoutes(app, { db, registry, config, log }) {
         `Unregistered repository "${repoFullName || '(missing)'}". Add it to ${registry.configPath}` +
           (registry.scopedSlug ? ` (this instance is pinned to "${registry.scopedSlug}")` : '')
       );
-      return res.status(202).json({ ok: true, ignored: true, reason: 'unregistered repository' });
+      return deny(res, 202, { ok: true, ignored: true, reason: 'unregistered repository' }, 'unregistered_repo');
     }
 
     const { secret, source, missing } = resolveWebhookSecret(project);
 
     if (missing || !secret) {
       log.error(`No webhook secret available (${source}) for ${repoFullName || 'unknown repo'}`);
-      return res.status(503).json({ error: `Webhook secret ${source} is not configured` });
+      return deny(res, 503, { error: `Webhook secret ${source} is not configured` }, 'webhook_secret_missing');
     }
 
     if (!verifySignature(rawBody, req.get('x-hub-signature-256'), secret)) {
       log.warn(`Rejected delivery ${deliveryId || '(no id)'} for ${repoFullName || 'unknown repo'}: bad signature`);
-      return res.status(401).json({ error: 'Invalid HMAC signature' });
+      return deny(res, 401, { error: 'Invalid HMAC signature' }, 'bad_signature');
     }
 
+    res.locals.accessReason = 'github_delivery';
     if (event === 'ping') {
       return res.json({ ok: true, pong: true, project_slug: project.slug });
     }
@@ -240,6 +243,10 @@ function mountControlRoutes(app, { db, registry, config, log }) {
 
   // ---------------------------------------------------------------- ops
 
+  app.get('/api/agent/access', guard, (req, res) => {
+    return res.json(readAccessLog(db, { limit: req.query.limit }));
+  });
+
   app.get('/api/health', (_req, res) => {
     return res.json({
       ok: true,
@@ -276,8 +283,9 @@ function mountFallbacks(app, log) {
  * hostname — brute-forceable, unrate-limited, and with /api/health handing a scanner the SQLite
  * version and task counts. Those subdomains do get scanned; the random name is not secret-grade.
  */
-export function createWebhookApp({ db, registry, config, log = createLogger('Webhook'), meta = null }) {
+export function createWebhookApp({ db, registry, config, log = createLogger('Webhook'), meta = null, notify } = {}) {
   const app = baseApp('10mb');
+  app.use(tunnelAccessMiddleware(db, { log, notify }));
   if (meta) {
     app.use(githubSourceGuard(meta, { logger: log }));
   }
@@ -289,7 +297,7 @@ export function createWebhookApp({ db, registry, config, log = createLogger('Web
  * The orchestrator-facing app: everything the daemon uses, on a listener the tunnel cannot reach
  * and a browser cannot address. See src/net-guards.mjs for why the header checks are enough.
  */
-export function createControlApp({ db, registry, config, log = createLogger('Control') }) {
+export function createControlApp({ db, registry, config, log = createLogger('Control'), notify } = {}) {
   const app = baseApp('1mb');
   if (config.controlAllowedHosts?.length) {
     app.use(
@@ -297,6 +305,7 @@ export function createControlApp({ db, registry, config, log = createLogger('Con
         allowedHosts: config.controlAllowedHosts,
         requireLoopbackPeer: config.controlRequireLoopbackPeer,
         logger: log,
+        notify,
       })
     );
   }
@@ -315,11 +324,38 @@ export function createApp({ db, registry, config, log = createLogger() }) {
   return mountFallbacks(app, log);
 }
 
+function deny(res, status, body, reason) {
+  res.locals.accessReason = reason;
+  return res.status(status).json(body);
+}
+
 /** Explain a 409 precisely: unknown id versus wrong status. */
 function notProcessing(db, id) {
   const task = queue.getTask(db, id);
   if (!task) return { error: 'No such task' };
   return { error: `Task is "${task.status}", not "processing"`, status: task.status };
+}
+
+let metaAlerted = false;
+
+/** One push when the hooks list fails to load. Later failures stay in the log until a refresh succeeds. */
+async function noteMeta(metaResult, log) {
+  if (metaResult.ok) {
+    metaAlerted = false;
+    if (!metaResult.cached) log.info(`Loaded ${metaResult.count} GitHub hooks CIDR range(s)`);
+    return;
+  }
+  log.info(
+    `Could not load GitHub hooks ranges (${metaResult.error.message}); source-IP checks skipped until they load`
+  );
+  if (metaAlerted) return;
+  metaAlerted = true;
+  await notifyAdmin({
+    title: 'tmt tunnel',
+    tags: 'warning',
+    body: `GitHub hooks ranges unavailable (${metaResult.error.message}). Source-IP checks are skipped until they load.`,
+    log,
+  });
 }
 
 export function startReaper(db, { intervalSeconds, backoffSeconds }, log) {
@@ -330,6 +366,8 @@ export function startReaper(db, { intervalSeconds, backoffSeconds }, log) {
         const requeued = reaped.filter((r) => r.status === 'pending').length;
         log.warn(`Reaped ${reaped.length} expired lease(s): ${requeued} requeued, ${reaped.length - requeued} failed`);
       }
+      const pruned = pruneTunnelHits(db);
+      if (pruned) log.info(`Pruned ${pruned} tunnel hit(s) older than 30 days`);
     } catch (err) {
       log.error(`Reaper error: ${err.message}`);
     }
@@ -361,12 +399,10 @@ export async function main() {
   // logged and skipped rather than dropping every delivery. The check itself cannot be disabled.
   const meta = createGithubMeta();
   const metaResult = await meta.refresh();
-  log.info(
-    metaResult.ok
-      ? `Loaded ${metaResult.count} GitHub hooks CIDR range(s)`
-      : `Could not load GitHub hooks ranges (${metaResult.error.message}); source-IP checks skipped until they load`
-  );
-  const metaRefresher = setInterval(() => meta.refresh(), 6 * 60 * 60 * 1000);
+  await noteMeta(metaResult, log);
+  const metaRefresher = setInterval(() => {
+    meta.refresh().then((result) => noteMeta(result, log)).catch((err) => log.error(err.message));
+  }, 6 * 60 * 60 * 1000);
   metaRefresher.unref();
 
   const webhookApp = createWebhookApp({ db, registry, config, log: createLogger('Webhook'), meta });

@@ -162,7 +162,7 @@ describe('shared instance', () => {
   });
 
   test('the orchestrator loop: poll, heartbeat, complete', async () => {
-    // PLAN.md's orchestrator posts no body at all, so this must work without one.
+    // The orchestrator sometimes posts no body, so poll must work without one.
     const polled = await fetch(`${srv.base}/api/agent/poll`, { method: 'POST', headers: srv.auth });
     const { task } = await polled.json();
     assert.equal(task.project_slug, 'main-app');

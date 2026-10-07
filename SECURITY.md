@@ -11,6 +11,8 @@ Designed to protect against:
 - A GitHub user who can cause a delivery for a registered repository. Write collaborators are allowed to enqueue work. Their issue and comment text is still untrusted input to the model.
 - The process inside a runner container, which is where that text is trying to steer the agent, and where repository code and `npm` scripts actually execute.
 
+Overall, this will never be a high traffic system. Any abnormal or excessive requests to the tunnel get flagged and the admin is notified.
+
 Not designed to protect against:
 
 - Someone who already runs code as the operator, or who can talk to the Docker socket.
@@ -290,6 +292,16 @@ The tunnel accepts a body up to 10 MB and checks the signature after the body is
 There is no application rate limit. A client without the secret can spend CPU on the machine
 and cannot write a row. This is a local availability concern for a single-user box, not a way
 into the queue.
+
+### Admin alerts
+
+Every request on the tunnel listener is stored per client IP (`CF-Connecting-IP`). Anything
+that is not a signature-verified GitHub delivery can POST a metadata-only message to
+`ADMIN_NOTIFY_URL`: the IP, method, path, status, and reason. `ADMIN_NOTIFY_URL` and
+`ADMIN_NOTIFY_TOKEN` are secrets. The message does not include the body, the signature, or a
+secret value. Leak refusals use the same post, with needle names only. The credential proxy
+does not call that URL. It keeps those names on its loopback admin port, and the orchestrator
+drains them.
 
 ## Configuration that changes the posture
 

@@ -21,8 +21,8 @@ describe('verifySignature', () => {
   });
 
   test('rejects a signature computed over re-serialized JSON', () => {
-    // This is the bug in PLAN.md's server.mjs: hashing JSON.stringify(req.body) instead of
-    // the raw buffer. Round-tripping changes the bytes, so the digest no longer matches.
+    // Hashing JSON.stringify(req.body) instead of the raw buffer fails: round-tripping
+    // changes the bytes, so the digest no longer matches.
     const reserialized = Buffer.from(JSON.stringify(JSON.parse(body.toString('utf8'))), 'utf8');
     assert.notEqual(reserialized.length, body.length);
     assert.equal(verifySignature(body, signBody(reserialized, SECRET), SECRET), false);

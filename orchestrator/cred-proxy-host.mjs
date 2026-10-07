@@ -99,6 +99,21 @@ export async function registerGrant({ adminPort, adminSecret, grant, owner, repo
   if (!res.ok) throw new Error(`credential proxy refused the grant (${res.status})`);
 }
 
+/** Needle names the proxy refused to forward. Clears the ring. Empty when the proxy is down. */
+export async function drainSecurityEvents({ adminPort, adminSecret }) {
+  let res;
+  try {
+    res = await fetch(`http://127.0.0.1:${adminPort}/security-events`, {
+      headers: { authorization: `Bearer ${adminSecret}` },
+    });
+  } catch {
+    return [];
+  }
+  if (!res.ok) return [];
+  const body = await res.json().catch(() => null);
+  return Array.isArray(body?.events) ? body.events : [];
+}
+
 export async function revokeGrant({ adminPort, adminSecret, grant }) {
   let res;
   try {

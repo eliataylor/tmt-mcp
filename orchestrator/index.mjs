@@ -2,11 +2,20 @@ import { randomBytes } from 'node:crypto';
 import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { createCoalescer, notifyAdmin } from '../src/notify.mjs';
 import { ACTIONS } from '../src/triggers.mjs';
 import { loadConfig } from './config.mjs';
-import { ensureCredentialProxy, proxyUrl, registerGrant, revokeGrant, runnerSecrets } from './cred-proxy-host.mjs';
+import {
+  drainSecurityEvents,
+  ensureCredentialProxy,
+  proxyUrl,
+  registerGrant,
+  revokeGrant,
+  runnerSecrets,
+} from './cred-proxy-host.mjs';
 import { directNoProxy, egressOptionsFrom } from './egress.mjs';
-import { assertNoLeak, leakNeedles } from './leak.mjs';
+import { leakNeedles } from './leak.mjs';
+import { refuseIfLeak } from './leak-alert.mjs';
 import { githubMcpEnv } from './mcp.mjs';
 import { createQueueClient } from './queue-client.mjs';
 import { createStore } from './state.mjs';
@@ -285,7 +294,7 @@ async function handleTask(ctx, task) {
         const body =
           `Picked this up locally. Working on \`${clone.branch}\`, tracking in #${prNumber}.\n\n` +
           `The plan lives in [\`${planPath}\`](${planLink}). I will link each revision here.`;
-        assertNoLeak(body, needles);
+        await refuseIfLeak(body, needles, { label, issueNumber });
         await gh.commentOnIssue({
           owner,
           repo: repoName,
@@ -552,7 +561,7 @@ async function publishPlanRevision({
   } catch {
     planText = null;
   }
-  if (planText !== null) assertNoLeak(planText, needles);
+  if (planText !== null) await refuseIfLeak(planText, needles, { label, issueNumber });
 
   const revision = await commitPlanRevision({
     clonePath,
@@ -576,7 +585,7 @@ async function publishPlanRevision({
   if (!body) {
     throw new Error(`${planPath} has never been committed and the agent did not write it`);
   }
-  assertNoLeak(body, needles);
+  await refuseIfLeak(body, needles, { label, issueNumber });
   await gh.commentOnIssue({ owner, repo, issueNumber, body });
   logger.log(
     `[Task] ${label} ${revision.changed ? `linked plan revision ${revision.revision}` : 'plan unchanged; commented'}`
@@ -617,7 +626,7 @@ async function commentPreviewUrl(ctx, { gh, owner, repo, issueNumber, branch, cl
       return;
     }
 
-    assertNoLeak(body, needles);
+    await refuseIfLeak(body, needles, { label, issueNumber });
     await gh.commentOnIssue({ owner, repo, issueNumber, body });
     logger.log(`[Task] ${label} commented ${previews.length} preview URL(s)`);
   } catch (err) {
@@ -704,6 +713,30 @@ async function cleanupArtifacts(ctx, { label, containerName, clonePath, workspac
   if (workspaceId && ctx.herdrAvailable) await ctx.herdr.closeWorkspace(workspaceId);
 }
 
+async function reportProxyLeaks(ctx, coalescer) {
+  const proxy = ctx.proxy;
+  if (!proxy?.adminSecret) return;
+  try {
+    const events = await drainSecurityEvents({
+      adminPort: proxy.adminPort,
+      adminSecret: proxy.adminSecret,
+    });
+    for (const event of events) {
+      const names = (Array.isArray(event.needles) ? event.needles : []).filter((name) => typeof name === 'string');
+      if (!names.length) continue;
+      const key = `${event.host || ''}\0${event.method || ''}\0${[...names].sort().join(',')}`;
+      if (!coalescer.allow(key)) continue;
+      await notifyAdmin({
+        title: 'tmt leak',
+        tags: 'rotating_light',
+        body: `Credential proxy refused a ${event.method || 'request'} to ${event.host || 'unknown host'}: ${names.join(', ')}`,
+      });
+    }
+  } catch (err) {
+    logger.warn(`[Proxy] could not read security events: ${err.message}`);
+  }
+}
+
 /**
  * Self-scheduling poll loop.
  *
@@ -712,6 +745,7 @@ async function cleanupArtifacts(ctx, { label, containerName, clonePath, workspac
  */
 function startPolling(ctx) {
   const { intervalMs, jitterMs, maxConcurrent, worker } = ctx.config.poll;
+  const proxyLeaks = createCoalescer();
   let inFlight = 0;
   let stopped = false;
   let timer = null;
@@ -720,6 +754,7 @@ function startPolling(ctx) {
     if (stopped) return;
 
     try {
+      await reportProxyLeaks(ctx, proxyLeaks);
       while (!stopped && inFlight < maxConcurrent) {
         const task = await ctx.queue.poll({ worker, projectSlugs: ctx.config.slugs() });
         if (!task) break;

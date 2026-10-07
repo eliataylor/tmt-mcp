@@ -35,3 +35,32 @@ CREATE INDEX IF NOT EXISTS idx_agent_tasks_claim  ON agent_tasks(project_slug, s
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_repo   ON agent_tasks(repo_full_name);
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_issue  ON agent_tasks(project_slug, github_issue_number);
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_lease  ON agent_tasks(lease_expires_at) WHERE status = 'processing';
+
+-- Every request the tunnel-facing listener sees. unusual rows are anything that is not a
+-- signature-verified GitHub delivery. The per-IP rollup is what an admin reads; raw hits are
+-- pruned after 30 days. last_notified_hit_id is the newest unusual hit already included in an
+-- alert, so the next push can say how many landed during the quiet period.
+CREATE TABLE IF NOT EXISTS tunnel_hits (
+    id          INTEGER PRIMARY KEY,
+    ip          TEXT NOT NULL,
+    method      TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    status      INTEGER NOT NULL,
+    reason      TEXT NOT NULL,
+    user_agent  TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_tunnel_hits_ip      ON tunnel_hits(ip, id);
+CREATE INDEX IF NOT EXISTS idx_tunnel_hits_created ON tunnel_hits(created_at);
+
+CREATE TABLE IF NOT EXISTS tunnel_ips (
+    ip                    TEXT PRIMARY KEY,
+    first_seen            TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen             TEXT NOT NULL DEFAULT (datetime('now')),
+    hits                  INTEGER NOT NULL DEFAULT 0,
+    unusual_hits          INTEGER NOT NULL DEFAULT 0,
+    last_reason           TEXT,
+    last_notified_at      TEXT,
+    last_notified_hit_id  INTEGER
+);

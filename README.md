@@ -21,7 +21,6 @@ Express + SQLite service that turns GitHub issue activity into tasks for a local
 
 | Doc | Read it for |
 | --- | --- |
-| [PLAN.md](PLAN.md) | Original design. Where it disagrees with this repo (worktrees, `github_issue_id`, poll on port 3000), this README is current. |
 | [SECURITY.md](SECURITY.md) | Threat model, HMAC and admission, control-plane headers, credential split, runner sandbox, egress, residual risks |
 | [DEBUG.md](DEBUG.md) | A finished run: `worker.log`, reasoning, tool calls, shell commands, fetches |
 
@@ -246,7 +245,7 @@ A unix socket would keep browsers from addressing the control plane. It does not
 | Duration | `LEASE_SECONDS`. If the orchestrator dies, the reaper returns the task to `pending`, or `failed` once attempts are spent. |
 | Per issue | One task in flight. A burst of comments cannot open two clones for the same issue. |
 
-`github_issue_id` is GitHub's internal id. Branch and clone names use `github_issue_number` (also `context.issue.number`). [PLAN.md](PLAN.md)'s draft uses `github_issue_id` for both.
+`github_issue_id` is GitHub's internal id. Branch and clone names use `github_issue_number` (also `context.issue.number`).
 
 ## Deployment
 
@@ -353,7 +352,7 @@ Optional PostHog MCP: a [personal API key](https://posthog.com/docs/api/personal
 
 `.cursor/mcp.json` points the SQLite MCP server at `sqlite_data/`. Treat that as a debugging convenience. The container holds the file open in WAL mode across a Docker Desktop bind mount, and WAL coordinates readers through a `-shm` file that does not cross the macOS VM boundary reliably. Host-side reads can be stale or hit locking errors.
 
-**Use `GET /api/agent/tasks` for anything that matters.**
+**Use `GET /api/agent/tasks` for anything that matters.** Tunnel probes are `GET /api/agent/access`.
 
 ## Environment
 
@@ -370,6 +369,7 @@ Optional PostHog MCP: a [personal API key](https://posthog.com/docs/api/personal
 | `CONTROL_REQUIRE_LOOPBACK_PEER` | Also require a loopback peer IP; off by default because Docker Desktop rewrites it to the gateway |
 | `LEASE_SECONDS`, `MAX_ATTEMPTS`, `RETRY_BACKOFF_SECONDS`, `REAPER_INTERVAL_SECONDS` | Queue behaviour |
 | `TUNNEL_METRICS_URL` | cloudflared metrics endpoint used to log the webhook URL |
+| `ADMIN_NOTIFY_URL`, `ADMIN_NOTIFY_TOKEN` | Optional. Text POST for tunnel probes and leak alerts (a private ntfy topic). Empty records hits and sends nothing. The same values belong in `.env.orchestrator`. The topic path is a secret; the message is metadata only. |
 
 Orchestrator variables live in `.env.orchestrator`. The annotated block is at the bottom of [`.env.example`](.env.example).
 
@@ -387,10 +387,10 @@ node scripts/replay-delivery.mjs --leave-pending   # queue a task for the real o
 ```
 src/            server.mjs db.mjs auth.mjs projects.mjs triggers.mjs
                 context.mjs references.mjs queue.mjs tunnel.mjs
-                net-guards.mjs github-meta.mjs
+                net-guards.mjs github-meta.mjs access-log.mjs notify.mjs
 orchestrator/   index.mjs config.mjs queue-client.mjs exec.mjs repo.mjs
                 github.mjs neon.mjs taskdir.mjs prompt.mjs runner.mjs
-                herdr.mjs state.mjs
+                herdr.mjs state.mjs leak-alert.mjs
 db/schema.sql            applied idempotently at boot
 config/                  tenant registry (projects.json is gitignored)
 docker/                  server image, agent-runner image, agent entrypoint

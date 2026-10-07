@@ -130,6 +130,7 @@ describe('credential proxy', { concurrency: 1 }, () => {
       token: TOKEN,
       adminSecret: ADMIN,
       caDir: join(root, 'ca'),
+      logger: { warn() {} },
       dial: (host) => ({
         hostname: '127.0.0.1',
         port: upstream.port,
@@ -229,6 +230,15 @@ describe('credential proxy', { concurrency: 1 }, () => {
     assert.equal(leaked.body, 'rejected');
     assert.equal(leaked.body.includes(password), false);
     assert.equal(seen.length, before);
+
+    const drained = await adminJson(proxy, 'GET', '/security-events');
+    assert.equal(drained.events.length, 1);
+    assert.deepEqual(drained.events[0].needles, ['DATABASE_URL_PASSWORD']);
+    assert.equal(drained.events[0].host, 'api.github.com');
+    assert.equal(drained.events[0].method, 'POST');
+    assert.equal(JSON.stringify(drained).includes(password), false);
+    const again = await adminJson(proxy, 'GET', '/security-events');
+    assert.deepEqual(again.events, []);
 
     const clean = await connectRequest({
       proxy,
@@ -486,7 +496,9 @@ async function adminJson(proxy, method, path, body) {
     },
     body: body ? JSON.stringify(body) : undefined,
   });
+  const text = await res.text();
   if (!res.ok) throw new Error(`admin ${method} ${path} -> ${res.status}`);
+  return text ? JSON.parse(text) : null;
 }
 
 async function connectRequest({ proxy, grant, host, method = 'GET', path, headers = {}, body }) {

@@ -122,7 +122,7 @@ describe('listener split', () => {
 
     try {
       // These are the endpoints that would otherwise be live on a public trycloudflare hostname.
-      for (const path of ['/api/agent/poll', '/api/agent/tasks', '/api/health']) {
+      for (const path of ['/api/agent/poll', '/api/agent/tasks', '/api/agent/access', '/api/health']) {
         const res = await fetch(`${base}${path}`, {
           method: path === '/api/agent/poll' ? 'POST' : 'GET',
           headers: { authorization: 'Bearer poll-secret' },

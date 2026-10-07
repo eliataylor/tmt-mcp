@@ -11,6 +11,8 @@
  * absence costs nothing and rejects every browser-originated request.
  */
 
+import { createCoalescer, notifyAdmin } from './notify.mjs';
+
 const LOOPBACK_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 
 export function isLoopbackAddress(address) {
@@ -56,10 +58,21 @@ export function checkControlRequest(req, { allowedHosts, requireLoopbackPeer = f
 
 /** Express middleware wrapper around checkControlRequest. */
 export function controlPlaneGuard(options) {
+  const allow = options.coalescer || createCoalescer();
+  const notify = options.notify || notifyAdmin;
   return function guard(req, res, next) {
     const verdict = checkControlRequest(req, options);
     if (!verdict.ok) {
       options.logger?.warn?.(`[Control] rejected request: ${verdict.reason}`);
+      if (allow.allow(verdict.reason)) {
+        const host = String(req.headers.host || '').slice(0, 200);
+        const peer = String(req.socket?.remoteAddress || '');
+        notify({
+          title: 'tmt control',
+          tags: 'warning',
+          body: `Control plane rejected ${req.method || 'GET'} ${req.path || '/'}: ${verdict.reason}\nhost: ${host}\npeer: ${peer}`,
+        }).catch(() => {});
+      }
       // Deliberately terse: a browser probe learns nothing about what is listening here.
       return res.status(403).json({ error: 'Forbidden' });
     }
@@ -88,6 +101,7 @@ export function githubSourceGuard(meta, { logger = console } = {}) {
     if (verdict) return next();
 
     logger.warn?.(`[Webhook] rejected delivery from ${claimed}: outside GitHub hooks ranges`);
+    res.locals.accessReason = 'outside_github_ranges';
     return res.status(403).json({ error: 'Forbidden' });
   };
 }

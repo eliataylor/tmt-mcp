@@ -348,13 +348,25 @@ export async function createCredentialProxy({
   listenHost = '127.0.0.1',
   dial = (host) => ({ hostname: host, port: 443, servername: host }),
   connectTunnel,
+  logger = console,
 }) {
   const readToken = typeof token === 'function' ? token : () => token;
   const readAdmin = typeof adminSecret === 'function' ? adminSecret : () => adminSecret;
   const ca = createCertificateAuthority(caDir);
   const leafs = new Map();
   const inners = new Set();
+  const securityEvents = [];
   const openTunnel = connectTunnel || ((host, port) => netConnect(port, host));
+  const recordLeak = (host, method, needles) => {
+    securityEvents.push({
+      time: new Date().toISOString(),
+      needles,
+      host,
+      method,
+    });
+    if (securityEvents.length > 100) securityEvents.shift();
+    logger.warn?.(`[Proxy] refused comment containing ${needles.join(', ')}`);
+  };
 
   const proxy = createHttpServer((_req, res) => {
     res.writeHead(405, { 'content-type': 'text/plain' });
@@ -386,7 +398,7 @@ export async function createCredentialProxy({
         rejectConnect(clientSocket, '407 Proxy Authentication Required');
         return;
       }
-      intercept(clientSocket, head, target.host, scope, { ca, leafs, readToken, dial, inners });
+      intercept(clientSocket, head, target.host, scope, { ca, leafs, readToken, dial, inners, recordLeak });
       return;
     }
     if (!scope) {
@@ -396,7 +408,7 @@ export async function createCredentialProxy({
     tunnel(clientSocket, head, target.host, target.port, openTunnel);
   });
 
-  const admin = createHttpServer((req, res) => handleAdmin(req, res, { registry, readAdmin }));
+  const admin = createHttpServer((req, res) => handleAdmin(req, res, { registry, readAdmin, securityEvents }));
   admin.timeout = 30_000;
   admin.on('clientError', (_err, socket) => socket.destroy());
 
@@ -473,7 +485,9 @@ function forward(req, res, host, scope, ctx) {
   if (isGithubCommentWrite(host, method, req.url)) {
     readBody(req, COMMENT_BODY_MAX)
       .then((body) => {
-        if (leakHits(body, scope?.needles).length) {
+        const leaked = leakHits(body, scope?.needles);
+        if (leaked.length) {
+          ctx.recordLeak?.(host, method, leaked);
           endPlain(res, 403);
           return;
         }
@@ -578,7 +592,7 @@ function tunnel(clientSocket, head, host, port, openTunnel) {
   if (upstream.readyState === 'open') start();
 }
 
-function handleAdmin(req, res, { registry, readAdmin }) {
+function handleAdmin(req, res, { registry, readAdmin, securityEvents }) {
   let expected = '';
   try {
     expected = readAdmin();
@@ -596,6 +610,12 @@ function handleAdmin(req, res, { registry, readAdmin }) {
   if (req.method === 'GET' && url.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"ok":true}');
+    return;
+  }
+  if (req.method === 'GET' && url.pathname === '/security-events') {
+    const events = securityEvents.splice(0, securityEvents.length);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ events }));
     return;
   }
   if (req.method === 'POST' && url.pathname === '/grants') {

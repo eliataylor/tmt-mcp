@@ -19,5 +19,4 @@ fixtures
 scripts
 docs
 README.md
-PLAN.md
 docker-compose*.yml
