@@ -82,7 +82,7 @@ export function buildProxyRunArgs({
   ];
 }
 
-export async function registerGrant({ adminPort, adminSecret, grant, owner, repo }) {
+export async function registerGrant({ adminPort, adminSecret, grant, owner, repo, needles = null }) {
   let res;
   try {
     res = await fetch(`http://127.0.0.1:${adminPort}/grants`, {
@@ -91,7 +91,7 @@ export async function registerGrant({ adminPort, adminSecret, grant, owner, repo
         authorization: `Bearer ${adminSecret}`,
         'content-type': 'application/json',
       },
-      body: JSON.stringify({ grant, owner, repo }),
+      body: JSON.stringify({ grant, owner, repo, needles }),
     });
   } catch {
     throw new Error('credential proxy did not accept the grant');

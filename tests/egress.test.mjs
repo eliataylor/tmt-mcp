@@ -170,6 +170,42 @@ describe('publish scan', () => {
   test('short values are not treated as secrets', () => {
     assert.deepEqual(leakHits('sk-short', leakNeedles({ secrets: { CURSOR_API_KEY: 'short' } })), []);
   });
+
+  test('a database url is split into host, username, and password', () => {
+    const pooled =
+      'postgresql://branch_user_abcdef:p%40ssword-value@ep-example-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require';
+    const direct =
+      'postgresql://branch_user_abcdef:p%40ssword-value@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require';
+    const withUrl = leakNeedles({
+      secrets: { CURSOR_API_KEY: 'sk-cursor-secret-value' },
+      databaseUrls: { DATABASE_URL: pooled, DATABASE_URL_UNPOOLED: direct },
+    });
+    assert.equal(withUrl.DATABASE_URL_HOST, 'ep-example-pooler.us-east-2.aws.neon.tech');
+    assert.equal(withUrl.DATABASE_URL_USERNAME, 'branch_user_abcdef');
+    assert.equal(withUrl.DATABASE_URL_PASSWORD, 'p@ssword-value');
+    assert.equal(withUrl.DATABASE_URL_PASSWORD_ENCODED, 'p%40ssword-value');
+    assert.equal(withUrl.DATABASE_URL_UNPOOLED_HOST, 'ep-example.us-east-2.aws.neon.tech');
+    assert.deepEqual(leakHits(`host ${withUrl.DATABASE_URL_HOST}`, withUrl), ['DATABASE_URL_HOST']);
+    assert.ok(leakHits(pooled, withUrl).includes('DATABASE_URL_PASSWORD_ENCODED'));
+    assert.ok(leakHits(pooled, withUrl).includes('DATABASE_URL_HOST'));
+    assert.ok(leakHits(pooled, withUrl).includes('DATABASE_URL_USERNAME'));
+    assert.throws(() => assertNoLeak('password p@ssword-value', withUrl), /DATABASE_URL_PASSWORD/);
+    assert.throws(
+      () => assertNoLeak('direct host ep-example.us-east-2.aws.neon.tech', withUrl),
+      /DATABASE_URL_UNPOOLED_HOST/
+    );
+  });
+
+  test('short database url parts are not treated as secrets', () => {
+    const needles = leakNeedles({
+      databaseUrls: { DATABASE_URL: 'postgresql://postgres:short@localhost/db' },
+    });
+    assert.equal(needles.DATABASE_URL_HOST, 'localhost');
+    assert.equal(needles.DATABASE_URL_USERNAME, 'postgres');
+    assert.equal(needles.DATABASE_URL_PASSWORD, 'short');
+    assert.deepEqual(leakHits('localhost postgres short', needles), []);
+    assert.deepEqual(leakHits('all clear', leakNeedles({ databaseUrls: { DATABASE_URL: 'not a url' } })), []);
+  });
 });
 
 describe('github mcp mode', () => {

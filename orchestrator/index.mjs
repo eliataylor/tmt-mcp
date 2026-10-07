@@ -198,7 +198,7 @@ async function handleTask(ctx, task) {
   let succeeded = false;
   let releaseGrant = async () => {};
   const canary = `tmt-canary-${randomBytes(16).toString('hex')}`;
-  const needles = leakNeedles({ secrets: config.secrets, canary });
+  let needles = leakNeedles({ secrets: config.secrets, canary });
 
   const stopHeartbeat = startHeartbeat(ctx, task, containerName, label);
 
@@ -282,13 +282,15 @@ async function handleTask(ctx, task) {
       store.merge(slug, issueNumber, { pr_number: prNumber, pr_url: pr.html_url });
 
       if (ensured.created) {
+        const body =
+          `Picked this up locally. Working on \`${clone.branch}\`, tracking in #${prNumber}.\n\n` +
+          `The plan lives in [\`${planPath}\`](${planLink}). I will link each revision here.`;
+        assertNoLeak(body, needles);
         await gh.commentOnIssue({
           owner,
           repo: repoName,
           issueNumber,
-          body:
-            `Picked this up locally. Working on \`${clone.branch}\`, tracking in #${prNumber}.\n\n` +
-            `The plan lives in [\`${planPath}\`](${planLink}). I will link each revision here.`,
+          body,
         });
       }
 
@@ -332,6 +334,15 @@ async function handleTask(ctx, task) {
     // Runner credentials only. The GitHub token stays in the credential proxy; this file gets a
     // per-task grant in the proxy URL, which is useless off the runner network. writeSecrets
     // hard-fails on the Neon key and the queue token. PostHog is optional (see posthog.mjs).
+    needles = leakNeedles({
+      secrets: config.secrets,
+      canary,
+      databaseUrls: {
+        DATABASE_URL: neonInfo?.databaseUrl || null,
+        DATABASE_URL_UNPOOLED: neonInfo?.databaseUrlUnpooled || null,
+      },
+    });
+
     const grant = randomBytes(32).toString('hex');
     const egressOpts = egressOptionsFrom(config);
     if (ctx.proxy?.adminSecret) {
@@ -342,6 +353,7 @@ async function handleTask(ctx, task) {
         grant,
         owner,
         repo: repoName,
+        needles,
       });
       releaseGrant = () =>
         revokeGrant({

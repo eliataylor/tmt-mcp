@@ -9,6 +9,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import { leakHits } from './leak.mjs';
+
 /**
  * HTTP proxy that holds the GitHub token.
  *
@@ -63,7 +65,11 @@ export function createGrantRegistry() {
       if (!REPO_PART.test(scope?.owner || '') || !REPO_PART.test(scope?.repo || '')) {
         throw new Error('grant scope is not an owner/repo');
       }
-      grants.set(grant, { owner: scope.owner, repo: scope.repo });
+      grants.set(grant, {
+        owner: scope.owner,
+        repo: scope.repo,
+        needles: acceptNeedles(scope.needles),
+      });
     },
     delete(grant) {
       grants.delete(grant);
@@ -117,6 +123,47 @@ export function requestAllowed(host, rawUrl, scope, method = 'GET') {
     return startsWithRepo(url.pathname, owner, repo);
   }
   return containsRepo(url.pathname, owner, repo);
+}
+
+const NEEDLE_NAME = /^[A-Za-z0-9_]{1,80}$/;
+const COMMENT_BODY_MAX = 1024 * 1024;
+const GRANT_BODY_MAX = 64 * 1024;
+
+/**
+ * Issue comments, pull-request review comments, and reviews. These are the writes that show up
+ * on the issue. Git pack data and other repo API calls are not buffered.
+ */
+const COMMENT_WRITE =
+  /^\/repos\/[^/]+\/[^/]+\/(?:issues\/(?:\d+\/comments|comments\/\d+)|pulls\/(?:\d+\/comments(?:\/\d+\/replies)?|comments\/\d+|\d+\/reviews(?:\/\d+)?))$/;
+
+export function isGithubCommentWrite(host, method, rawUrl) {
+  if (host !== 'api.github.com') return false;
+  const verb = String(method || '').toUpperCase();
+  if (verb !== 'POST' && verb !== 'PATCH' && verb !== 'PUT') return false;
+  let pathname;
+  try {
+    pathname = new URL(rawUrl, 'https://api.github.com').pathname.replace(/\/+$/, '');
+  } catch {
+    return false;
+  }
+  return COMMENT_WRITE.test(pathname);
+}
+
+/** Plain string map stored on a grant. Values are not logged. Null when the grant has none. */
+function acceptNeedles(value) {
+  if (value == null) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) throw new Error('needles must be an object');
+  const entries = Object.entries(value);
+  if (entries.length > 32) throw new Error('too many needles');
+  const out = {};
+  for (const [name, needle] of entries) {
+    if (!NEEDLE_NAME.test(name)) throw new Error('bad needle name');
+    if (needle == null) continue;
+    if (typeof needle !== 'string') throw new Error('needle must be a string');
+    if (needle.length > 8192) throw new Error('needle is too long');
+    out[name] = needle;
+  }
+  return out;
 }
 
 function apiAllowed(url, owner, repo, method) {
@@ -423,6 +470,25 @@ function forward(req, res, host, scope, ctx) {
     return;
   }
 
+  if (isGithubCommentWrite(host, method, req.url)) {
+    readBody(req, COMMENT_BODY_MAX)
+      .then((body) => {
+        if (leakHits(body, scope?.needles).length) {
+          endPlain(res, 403);
+          return;
+        }
+        dispatch(req, res, host, scope, ctx, allowed, body);
+      })
+      .catch(() => {
+        if (!res.headersSent) endPlain(res, 403);
+      });
+    return;
+  }
+
+  dispatch(req, res, host, scope, ctx, allowed, null);
+}
+
+function dispatch(req, res, host, scope, ctx, allowed, body) {
   const headers = { ...req.headers };
   for (const name of HOP_BY_HOP) delete headers[name];
   headers.host = host;
@@ -437,6 +503,10 @@ function forward(req, res, host, scope, ctx) {
       return;
     }
     headers.authorization = authorizationFor(host, token);
+  }
+  if (body != null) {
+    headers['content-length'] = String(Buffer.byteLength(body));
+    delete headers['transfer-encoding'];
   }
 
   const dialed = ctx.dial(host);
@@ -463,7 +533,8 @@ function forward(req, res, host, scope, ctx) {
     if (!res.headersSent) endPlain(res, 502);
     else res.end();
   });
-  req.pipe(upstream);
+  if (body == null) req.pipe(upstream);
+  else upstream.end(body);
   res.on('close', () => {
     if (!res.writableEnded) upstream.destroy();
   });
@@ -528,10 +599,14 @@ function handleAdmin(req, res, { registry, readAdmin }) {
     return;
   }
   if (req.method === 'POST' && url.pathname === '/grants') {
-    readBody(req)
+    readBody(req, GRANT_BODY_MAX)
       .then((body) => {
         const parsed = JSON.parse(body || '{}');
-        registry.put(parsed.grant, { owner: parsed.owner, repo: parsed.repo });
+        registry.put(parsed.grant, {
+          owner: parsed.owner,
+          repo: parsed.repo,
+          needles: parsed.needles,
+        });
         res.writeHead(204);
         res.end();
       })
@@ -552,13 +627,13 @@ function handleAdmin(req, res, { registry, readAdmin }) {
   res.end('rejected');
 }
 
-function readBody(req) {
+function readBody(req, max = 4096) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
     req.on('data', (chunk) => {
       size += chunk.length;
-      if (size > 4096) {
+      if (size > max) {
         reject(new Error('too large'));
         req.destroy();
         return;

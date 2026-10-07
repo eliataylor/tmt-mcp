@@ -18,6 +18,7 @@ import {
   createCertificateAuthority,
   createCredentialProxy,
   createGrantRegistry,
+  isGithubCommentWrite,
   issueLeaf,
   parseProxyAuthorization,
   requestAllowed,
@@ -69,6 +70,20 @@ describe('github request policy', () => {
       GRANT_A
     );
     assert.equal(parseProxyAuthorization('Bearer nope'), null);
+    assert.equal(
+      isGithubCommentWrite('api.github.com', 'POST', '/repos/Acme/widgets/issues/12/comments'),
+      true
+    );
+    assert.equal(
+      isGithubCommentWrite('api.github.com', 'POST', '/repos/Acme/widgets/pulls/3/reviews'),
+      true
+    );
+    assert.equal(isGithubCommentWrite('api.github.com', 'POST', '/repos/Acme/widgets/issues'), false);
+    assert.equal(isGithubCommentWrite('api.github.com', 'GET', '/repos/Acme/widgets/issues/12/comments'), false);
+    assert.equal(
+      isGithubCommentWrite('github.com', 'POST', '/Acme/widgets.git/git-receive-pack'),
+      false
+    );
   });
 });
 
@@ -187,6 +202,58 @@ describe('credential proxy', { concurrency: 1 }, () => {
     assert.equal(hit.authorization.includes('client-sent-secret'), false);
     assert.equal(hit.body.toString(), 'pack-bytes');
     assert.equal(hit.url, '/repos/Acme/widgets/issues');
+  });
+
+  test('a comment that repeats a grant needle is refused and not forwarded', async () => {
+    const password = 'super-secret-password';
+    await adminJson(proxy, 'POST', '/grants', {
+      grant: GRANT_A,
+      owner: 'Acme',
+      repo: 'widgets',
+      needles: {
+        DATABASE_URL_PASSWORD: password,
+        DATABASE_URL_HOST: 'ep-example-pooler.us-east-2.aws.neon.tech',
+      },
+    });
+    const before = seen.length;
+    const leaked = await connectRequest({
+      proxy,
+      grant: GRANT_A,
+      host: 'api.github.com',
+      method: 'POST',
+      path: '/repos/Acme/widgets/issues/12/comments',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ body: `branch password ${password}` }),
+    });
+    assert.equal(leaked.status, 403);
+    assert.equal(leaked.body, 'rejected');
+    assert.equal(leaked.body.includes(password), false);
+    assert.equal(seen.length, before);
+
+    const clean = await connectRequest({
+      proxy,
+      grant: GRANT_A,
+      host: 'api.github.com',
+      method: 'POST',
+      path: '/repos/Acme/widgets/issues/12/comments',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ body: 'plan looks fine' }),
+    });
+    assert.equal(clean.status, 200);
+    assert.equal(seen.at(-1).body.toString().includes('plan looks fine'), true);
+    assert.equal(seen.at(-1).authorization, `Bearer ${TOKEN}`);
+
+    const elsewhere = await connectRequest({
+      proxy,
+      grant: GRANT_A,
+      host: 'api.github.com',
+      method: 'POST',
+      path: '/repos/Acme/widgets/issues',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: password }),
+    });
+    assert.equal(elsewhere.status, 200);
+    assert.equal(seen.at(-1).url, '/repos/Acme/widgets/issues');
   });
 
   test('git hosts get basic auth, and a second request on the same connection is streamed', async () => {

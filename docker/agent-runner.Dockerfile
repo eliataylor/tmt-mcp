@@ -48,7 +48,7 @@ RUN set -eux; \
     rm -rf /tmp/*
 
 COPY docker/agent-entrypoint.sh /usr/local/bin/agent-entrypoint.sh
-COPY orchestrator/cred-proxy.mjs /usr/local/lib/tmt/cred-proxy.mjs
+COPY orchestrator/cred-proxy.mjs orchestrator/leak.mjs /usr/local/lib/tmt/
 RUN chmod 0755 /usr/local/bin/agent-entrypoint.sh
 
 # A fixed uid so the per-issue home volume, which this image seeds, stays writable at runtime.
