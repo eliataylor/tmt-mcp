@@ -66,7 +66,7 @@ function modeLine({ action, project, artifactPath, executeLabel, triageLabel, te
   if (action === ACTIONS.RESEARCH) {
     return `**Research** — write evidence into \`${artifactPath}\`. **Edit nothing else, and do not commit or push.**`;
   }
-  if (action === ACTIONS.GRAPHIC) {
+  if (action === ACTIONS.WIREFRAME || action === ACTIONS.GRAPHIC) {
     return (
       `**Wireframes** — write low-fidelity draw.io wireframes under \`wireframes/\` and index them in \`${artifactPath}\`. ` +
       '**Do not commit or push** (the orchestrator publishes the revision).'

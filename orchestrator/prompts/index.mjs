@@ -1,12 +1,16 @@
 import { ACTIONS } from '../../src/triggers.mjs';
 import { artifactKindForAction, ARTIFACT_KINDS } from '../artifacts.mjs';
 import { renderExecuteSections } from './execute.mjs';
-import { renderGraphicSections } from './graphic.mjs';
 import { renderMonitorSections } from './monitor.mjs';
 import { renderResearchSections } from './research.mjs';
 import { renderSddSections } from './sdd.mjs';
 import { renderTestSections } from './test.mjs';
 import { renderTriageSections } from './triage.mjs';
+import { renderWireframeSections } from './wireframe.mjs';
+
+function isWireframeAction(action) {
+  return action === ACTIONS.WIREFRAME || action === ACTIONS.GRAPHIC;
+}
 
 export function renderModeSections(ctx) {
   const { action } = ctx;
@@ -24,8 +28,8 @@ export function renderModeSections(ctx) {
   if (action === ACTIONS.RESEARCH) {
     return renderResearchSections({ ...ctx, executeLabel });
   }
-  if (action === ACTIONS.GRAPHIC) {
-    return renderGraphicSections({ ...ctx, executeLabel });
+  if (isWireframeAction(action)) {
+    return renderWireframeSections({ ...ctx, executeLabel });
   }
   if (action === ACTIONS.MONITOR) {
     return renderMonitorSections({ ...ctx, executeLabel });

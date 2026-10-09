@@ -11,6 +11,7 @@ import {
   createStartCommit,
   parsePorcelainPaths,
   readHeadSha,
+  readPushedSha,
   renderPlanScaffold,
   resolvePlanRelativePath,
 } from '../orchestrator/repo.mjs';
@@ -135,6 +136,26 @@ describe('plan scaffold', () => {
     }
     assert.match(out, /<!-- summary: -->/);
     assert.doesNotMatch(out, /\{(issue|issue_title|issue_url|task_id|created_at)\}/);
+  });
+});
+
+describe('readPushedSha', () => {
+  test('asks origin when the local remote-tracking ref is stale', async () => {
+    const { clone, remote } = await started();
+    const stale = sh(clone, 'rev-parse', 'HEAD');
+
+    writeFileSync(join(clone, 'app.js'), 'console.log("agent push");\n');
+    sh(clone, 'add', 'app.js');
+    sh(clone, 'commit', '-q', '-m', 'agent product commit');
+    sh(clone, 'push', '-q', 'origin', 'agent/issue-42');
+    const tip = sh(remote, 'rev-parse', 'agent/issue-42');
+    assert.notEqual(tip, stale);
+
+    // Simulate a container push that left refs/remotes/origin/<branch> on the pre-run tip.
+    sh(clone, 'update-ref', 'refs/remotes/origin/agent/issue-42', stale);
+    assert.equal(sh(clone, 'rev-parse', 'refs/remotes/origin/agent/issue-42'), stale);
+
+    assert.equal(await readPushedSha({ clonePath: clone, branch: 'agent/issue-42' }), tip);
   });
 });
 
@@ -299,11 +320,12 @@ describe('mention help', () => {
     assert.equal(needsTaskBranch('agent:sdd'), true);
   });
 
-  test('renders a sticky usage card with configured labels', () => {
+  test('renders a sticky usage card with configured tokens', () => {
     const body = renderMentionHelpComment({ project: PROJECT });
     assert.ok(body.startsWith(MENTION_HELP_MARKER));
-    assert.match(body, /@dev-agent agent:execute/);
+    assert.match(body, /assign `dev-agent`/);
     assert.match(body, /`agent:sdd`/);
+    assert.match(body, /backticked control token/);
     assert.equal(isTmtCardComment(body), true);
   });
 });

@@ -1,10 +1,10 @@
 import { controlLabelsList } from './_shared.mjs';
 
 /**
- * Graphic mode writes UX.md plus uncompressed draw.io wireframes under wireframes/.
+ * Wireframe mode writes UX.md plus uncompressed draw.io wireframes under wireframes/.
  * Not the single-file artifactFileRules — companion .drawio files are part of the deliverable.
  */
-export function renderGraphicSections({ project, taskId, artifactPath, executeLabel }) {
+export function renderWireframeSections({ project, taskId, artifactPath, executeLabel }) {
   const controlList = controlLabelsList(project);
   const issueDir = artifactPath.replace(/\/[^/]+$/, '');
   const wireDir = `${issueDir}/wireframes`;
@@ -15,7 +15,7 @@ export function renderGraphicSections({ project, taskId, artifactPath, executeLa
     `1. **No product code changes** — edit only \`/workspace/${artifactPath}\` and files under \`/workspace/${wireDir}/\` (uncompressed \`.drawio\` only). Do not install dependencies beyond what reading the tree needs.`,
     '2. **No git writes** — do not commit, push, or open a PR. When you exit, the orchestrator commits the index and wireframes, upserts the sticky issue card, and links that version. Edits anywhere else are reverted.',
     '3. Stay inside `/workspace` for read-only exploration (search, read files, `git log`, `git diff`).',
-    `4. Do not add or remove GitHub labels yourself. Never touch control labels (${controlList}). Humans apply \`${executeLabel}\` when they want code.`,
+    `4. Do not add or remove GitHub labels yourself. Never touch control labels (${controlList}). Humans wake execute by commenting \`${executeLabel}\` while you are assigned.`,
     '5. Do **not** post or edit the sticky issue card (`<!-- tmt:card:… -->`). The orchestrator mirrors the index into that comment.',
     '6. Fill in the `<!-- summary: ... -->` line with one sentence on what this revision says or changed.',
     '7. Put numbered human asks under `## Needs from you` (or write "None").',

@@ -6,38 +6,35 @@
  *   { kind: 'cancel', reason }   - drop this issue's pending tasks
  *   { kind: 'ignore', reason }   - acknowledge with 200 so GitHub does not retry
  *
- * Stage labels (defaults):
+ * Wake tokens (defaults) — must appear backticked in the issue/comment body, e.g. `agent:sdd`:
  *   agent:triage — labels + sizing comment; no branch
- *   agent:research / agent:graphic / agent:sdd / agent:monitor — stage markdown under .agent/plans/{n}/
+ *   agent:research / agent:wireframe / agent:sdd / agent:monitor — stage markdown under .agent/plans/{n}/
  *   agent:execute — implement from PLAN.md; write TEST.md Instructions
  *   agent:test — run TEST.md Instructions; write Results
  *
- * trigger_label (default agent:sdd) is the cancel label and the System Design wake.
+ * Gates: agent_login already assigned on the issue, plus a backticked token in that event's text.
+ * Label/assign webhooks do not wake. Cancel only on issue closed.
  */
 
 export const ACTIONS = {
   SDD: 'agent:sdd',
   /** @deprecated Use ACTIONS.SDD. Kept as an alias for older imports. */
   ASSIGNED: 'agent:sdd',
+  /** @deprecated No longer enqueued; kept for in-flight task mapping. */
   OPENED: 'agent:opened',
   EXECUTE: 'agent:execute',
   TRIAGE: 'agent:triage',
   RESEARCH: 'agent:research',
+  WIREFRAME: 'agent:wireframe',
+  /** @deprecated Use ACTIONS.WIREFRAME. Kept for in-flight task mapping. */
   GRAPHIC: 'agent:graphic',
   MONITOR: 'agent:monitor',
   TEST: 'agent:test',
+  /** @deprecated No longer enqueued; kept for in-flight task mapping. */
   COMMENT: 'comment_created',
-  /** Sticky usage reply when a mention has no Action token and no control labels. */
+  /** Sticky usage reply when wake cannot start a run (missing assignee and/or token). */
   MENTION_HELP: 'mention_help',
 };
-
-function labelNames(payload) {
-  return (payload?.issue?.labels || []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
-}
-
-function hasLabel(payload, name) {
-  return name ? labelNames(payload).some((l) => l === name) : false;
-}
 
 function projectLabels(project) {
   return {
@@ -45,7 +42,7 @@ function projectLabels(project) {
     execute: project.execute_label || 'agent:execute',
     triage: project.triage_label || 'agent:triage',
     research: project.research_label || 'agent:research',
-    graphic: project.graphic_label || 'agent:graphic',
+    wireframe: project.wireframe_label || 'agent:wireframe',
     monitor: project.monitor_label || 'agent:monitor',
     test: project.test_label || 'agent:test',
   };
@@ -59,9 +56,8 @@ function ignore(reason) {
 const WRITE_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 
 /**
- * Comments and newly opened issues can come from anyone who can see the repo. Label and assign
- * events are emitted only for users GitHub already allowed to edit the issue, so a missing
- * association does not fail those closed. An explicit NONE still does.
+ * Comments and newly opened issues can come from anyone who can see the repo.
+ * Label/assign events are ignored for wake; association checks remain for opened/comment.
  */
 function isTrustedActor(event, payload) {
   if (event === 'issue_comment') {
@@ -78,15 +74,11 @@ function isTrustedActor(event, payload) {
     return Boolean(same) && WRITE_ASSOCIATIONS.has(payload.issue?.author_association);
   }
 
-  if (action === 'labeled' || action === 'assigned') {
-    return !payload.sender?.author_association;
-  }
-
   return false;
 }
 
 /**
- * The agent's own comments and label changes must never re-trigger it.
+ * The agent's own comments must never re-trigger it.
  */
 function isAgentAuthor(user, project) {
   if (!user) return false;
@@ -109,82 +101,92 @@ function textHasMention(text, project) {
   return re.test(haystack);
 }
 
-function issueBodyHasMention(payload, project) {
-  return textHasMention(payload?.issue?.body || '', project);
+/** True when project.agent_login is already on the issue's assignee list. */
+export function issueHasAgentAssignee(payload, project) {
+  const login = project?.agent_login;
+  if (!login) return false;
+  const want = String(login).toLowerCase();
+  const assignees = payload?.issue?.assignees || [];
+  return assignees.some((a) => {
+    const name = typeof a === 'string' ? a : a?.login;
+    return name && String(name).toLowerCase() === want;
+  });
 }
 
 /**
- * Priority: execute → test → sdd → research / graphic / monitor → triage.
- * Returns the enqueue action, or null when nothing matches.
+ * Control-token names in SDLC Status order (earliest stage first).
+ * When several backticked tokens appear, prefer the earliest stage to avoid jumping ahead.
  */
-export function actionFromLabels(payload, project, { forComment = false } = {}) {
+function controlLabelsInStatusOrder(project) {
   const L = projectLabels(project);
-
-  if (hasLabel(payload, L.execute)) return ACTIONS.EXECUTE;
-  if (hasLabel(payload, L.test)) return ACTIONS.TEST;
-  if (hasLabel(payload, L.trigger)) {
-    return forComment ? ACTIONS.COMMENT : ACTIONS.SDD;
-  }
-  if (hasLabel(payload, L.research)) return ACTIONS.RESEARCH;
-  if (hasLabel(payload, L.graphic)) return ACTIONS.GRAPHIC;
-  if (hasLabel(payload, L.monitor)) return ACTIONS.MONITOR;
-  if (hasLabel(payload, L.triage)) return forComment ? null : ACTIONS.TRIAGE;
-  return null;
+  return [L.triage, L.research, L.wireframe, L.trigger, L.execute, L.test, L.monitor].filter(Boolean);
 }
 
-/** Label name → wake action (trigger maps to SDD, never comment_created / opened). */
-function labeledAction(name, project) {
+/** Token name → wake action (trigger maps to SDD). */
+function actionForControlToken(name, project) {
   const L = projectLabels(project);
   if (name === L.execute) return ACTIONS.EXECUTE;
   if (name === L.test) return ACTIONS.TEST;
   if (name === L.trigger) return ACTIONS.SDD;
   if (name === L.research) return ACTIONS.RESEARCH;
-  if (name === L.graphic) return ACTIONS.GRAPHIC;
+  if (name === L.wireframe) return ACTIONS.WIREFRAME;
   if (name === L.monitor) return ACTIONS.MONITOR;
   if (name === L.triage) return ACTIONS.TRIAGE;
   return null;
 }
 
 /**
- * Control-label names in priority order for matching tokens in mention text.
- */
-function controlLabelsInPriority(project) {
-  const L = projectLabels(project);
-  return [L.execute, L.test, L.trigger, L.research, L.graphic, L.monitor, L.triage].filter(Boolean);
-}
-
-/**
- * First configured control-label string that appears as a bare token in text.
- * Priority: execute → test → sdd → research → graphic → monitor → triage.
+ * First configured control token that appears wrapped in backticks, e.g. `agent:sdd`.
+ * Status order: triage → research → wireframe → sdd → execute → test → monitor.
  */
 export function controlLabelTokenInText(text, project) {
   const haystack = String(text || '');
   if (!haystack) return null;
-  for (const name of controlLabelsInPriority(project)) {
-    const re = new RegExp(`(?:^|[^A-Za-z0-9_-])${escapeRegex(name)}(?![A-Za-z0-9_-])`);
-    if (re.test(haystack)) return name;
+  for (const name of controlLabelsInStatusOrder(project)) {
+    if (haystack.includes('`' + name + '`')) return name;
   }
   return null;
 }
 
 /**
- * Mention wakes: text token → issue control labels → mention_help.
- * Never silently defaults to SDD.
+ * Resolve a wake from body/comment text.
+ * Returns a run action, MENTION_HELP (sticky only), or null (ignore).
+ * Caller must still enforce assignee for run actions; this maps token → action and help cases.
  */
-export function resolveMentionAction({ text, payload, project }) {
+export function resolveTextAction({ text, project }) {
   const token = controlLabelTokenInText(text, project);
   if (token) {
-    const mapped = labeledAction(token, project);
+    const mapped = actionForControlToken(token, project);
     if (mapped) return mapped;
   }
-  const fromLabels = actionFromLabels(payload, project, { forComment: false });
-  if (fromLabels) return fromLabels;
-  return ACTIONS.MENTION_HELP;
+  if (textHasMention(text, project)) return ACTIONS.MENTION_HELP;
+  return null;
 }
 
-/** Configured control-label names for help copy (deduped, stable order). */
+/** Configured control-token names for help copy (deduped, Status order). */
 export function configuredControlLabels(project) {
-  return [...new Set(controlLabelsInPriority(project))];
+  return [...new Set(controlLabelsInStatusOrder(project))];
+}
+
+/**
+ * Shared path for opened + comment: trusted actor assumed by caller.
+ * Token + assignee → enqueue run; token without assignee → mention_help sticky;
+ * mention without token → mention_help; else ignore.
+ */
+function enqueueFromText({ text, payload, project, emptyReason }) {
+  const resolved = resolveTextAction({ text, project });
+  if (!resolved) return ignore(emptyReason);
+
+  if (resolved === ACTIONS.MENTION_HELP) {
+    return { kind: 'enqueue', action: ACTIONS.MENTION_HELP };
+  }
+
+  if (!issueHasAgentAssignee(payload, project)) {
+    // Sticky help: assign the agent, then include a backticked token.
+    return { kind: 'enqueue', action: ACTIONS.MENTION_HELP };
+  }
+
+  return { kind: 'enqueue', action: resolved };
 }
 
 export function classify({ event, payload, project }) {
@@ -193,80 +195,35 @@ export function classify({ event, payload, project }) {
   if (!payload?.issue) return ignore(`unsupported event "${event}"`);
 
   const action = payload.action;
-  const L = projectLabels(project);
 
   if (event === 'issues') {
     switch (action) {
-      case 'labeled': {
-        if (isAgentAuthor(payload.sender, project)) {
-          return ignore('label was applied by the agent');
-        }
-        const name = payload.label?.name;
-        if (!isTrustedActor(event, payload)) {
-          return ignore('actor is not a write collaborator');
-        }
-        const mapped = labeledAction(name, project);
-        if (mapped) return { kind: 'enqueue', action: mapped };
-        return ignore(`label "${name}" is not a stage, execute, test or triage label`);
-      }
+      case 'labeled':
+        return ignore('label events do not wake the agent');
+
+      case 'unlabeled':
+        return ignore('unlabel events do not wake or cancel');
 
       case 'assigned':
-        if (!(project.agent_login && payload.assignee?.login === project.agent_login)) {
-          return ignore('assignee is not the agent login');
-        }
-        if (!isTrustedActor(event, payload)) {
-          return ignore('actor is not a write collaborator');
-        }
-        return { kind: 'enqueue', action: ACTIONS.SDD };
+        return ignore('assignment does not wake the agent; comment with a backticked control token');
 
-      case 'opened':
-      case 'reopened': {
+      case 'reopened':
+        return ignore('reopened does not wake; comment with a backticked control token');
+
+      case 'opened': {
         if (!isTrustedActor(event, payload)) {
           return ignore('actor is not a write collaborator');
         }
-        // Mentions use text token → issue labels → help (trigger label → SDD, not opened).
-        if (issueBodyHasMention(payload, project)) {
-          return {
-            kind: 'enqueue',
-            action: resolveMentionAction({
-              text: payload.issue?.body || '',
-              payload,
-              project,
-            }),
-          };
-        }
-        if (hasLabel(payload, L.execute)) {
-          return { kind: 'enqueue', action: ACTIONS.EXECUTE };
-        }
-        if (hasLabel(payload, L.test)) {
-          return { kind: 'enqueue', action: ACTIONS.TEST };
-        }
-        if (hasLabel(payload, L.trigger)) {
-          return { kind: 'enqueue', action: ACTIONS.OPENED };
-        }
-        if (hasLabel(payload, L.research)) {
-          return { kind: 'enqueue', action: ACTIONS.RESEARCH };
-        }
-        if (hasLabel(payload, L.graphic)) {
-          return { kind: 'enqueue', action: ACTIONS.GRAPHIC };
-        }
-        if (hasLabel(payload, L.monitor)) {
-          return { kind: 'enqueue', action: ACTIONS.MONITOR };
-        }
-        if (hasLabel(payload, L.triage)) {
-          return { kind: 'enqueue', action: ACTIONS.TRIAGE };
-        }
-        return ignore('issue does not carry a stage, execute, test or triage label and body has no mention');
+        return enqueueFromText({
+          text: payload.issue?.body || '',
+          payload,
+          project,
+          emptyReason: 'issue body has no backticked control token and no agent mention',
+        });
       }
 
       case 'closed':
         return { kind: 'cancel', reason: 'issue closed' };
-
-      case 'unlabeled':
-        if (payload.label?.name === L.trigger) {
-          return { kind: 'cancel', reason: 'trigger label removed' };
-        }
-        return ignore(`label "${payload.label?.name}" is not the trigger label`);
 
       default:
         return ignore(`issues.${action} is not a trigger`);
@@ -281,17 +238,12 @@ export function classify({ event, payload, project }) {
     if (!isTrustedActor(event, payload)) {
       return ignore('actor is not a write collaborator');
     }
-    const body = payload.comment?.body || '';
-    if (textHasMention(body, project)) {
-      return {
-        kind: 'enqueue',
-        action: resolveMentionAction({ text: body, payload, project }),
-      };
-    }
-    const fromLabels = actionFromLabels(payload, project, { forComment: true });
-    if (fromLabels) return { kind: 'enqueue', action: fromLabels };
-    // Triage is one-shot: later comments do not re-triage.
-    return ignore('comment has no agent mention and the issue lacks a revisable stage or execute/test label');
+    return enqueueFromText({
+      text: payload.comment?.body || '',
+      payload,
+      project,
+      emptyReason: 'comment has no backticked control token and no agent mention',
+    });
   }
 
   return ignore(`unsupported event "${event}"`);

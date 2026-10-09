@@ -78,7 +78,14 @@ describe('shared instance', () => {
   });
 
   test('a signed delivery is queued', async () => {
-    const res = await srv.deliver('issues.labeled.json', { delivery: 'd-queued' });
+    const res = await srv.deliver('issue_comment.created.json', {
+      event: 'issue_comment',
+      delivery: 'd-queued',
+      mutate: (payload) => {
+        payload.comment.body = 'Please revise with `agent:sdd`';
+        return payload;
+      },
+    });
     assert.equal(res.status, 201);
     const body = await res.json();
     assert.equal(body.project_slug, 'main-app');
@@ -87,23 +94,36 @@ describe('shared instance', () => {
   });
 
   test('a redelivery is acknowledged without queueing again', async () => {
-    const res = await srv.deliver('issues.labeled.json', { delivery: 'd-queued' });
+    const res = await srv.deliver('issue_comment.created.json', {
+      event: 'issue_comment',
+      delivery: 'd-queued',
+      mutate: (payload) => {
+        payload.comment.body = 'Please revise with `agent:sdd`';
+        return payload;
+      },
+    });
     assert.equal(res.status, 200);
     assert.equal((await res.json()).duplicate, true);
   });
 
   test('control ingest queues without HMAC', async () => {
-    const payload = JSON.parse(fixtureBuffer('issues.labeled.json').toString('utf8'));
-    payload.label.name = 'agent:execute';
+    const payload = JSON.parse(fixtureBuffer('issue_comment.created.json').toString('utf8'));
+    payload.comment.body = 'Ship it `agent:execute`';
     const res = await fetch(`${srv.base}/api/agent/ingest`, {
       method: 'POST',
       headers: srv.auth,
-      body: JSON.stringify({ event: 'issues', payload, delivery_id: 'ingest-execute-1' }),
+      body: JSON.stringify({ event: 'issue_comment', payload, delivery_id: 'ingest-execute-1' }),
     });
     assert.equal(res.status, 201);
     const body = await res.json();
     assert.equal(body.action, 'agent:execute');
     assert.equal(body.duplicate, false);
+  });
+
+  test('a label delivery is acknowledged without queueing', async () => {
+    const res = await srv.deliver('issues.labeled.json', { delivery: 'd-label-ignored' });
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).ignored, true);
   });
 
   test('the per-project secret is required, not the global one', async () => {
@@ -200,7 +220,14 @@ describe('shared instance', () => {
   });
 
   test('fail overwrites token_usage from the request body', async () => {
-    await srv.deliver('issues.labeled.json', { delivery: 'usage-fail-1' });
+    await srv.deliver('issue_comment.created.json', {
+      event: 'issue_comment',
+      delivery: 'usage-fail-1',
+      mutate: (payload) => {
+        payload.comment.body = '`agent:sdd` again';
+        return payload;
+      },
+    });
     const polled = await fetch(`${srv.base}/api/agent/poll`, {
       method: 'POST',
       headers: srv.auth,
@@ -270,11 +297,13 @@ describe('isolated instance (PROJECT_SLUG=side-project)', () => {
   });
 
   test('its own repo is queued and polling ignores a mismatched slug from the caller', async () => {
-    const res = await srv.deliver('issues.labeled.json', {
+    const res = await srv.deliver('issue_comment.created.json', {
+      event: 'issue_comment',
       delivery: 'd-side',
       secret: SIDE_SECRET,
       mutate: (payload) => {
         payload.repository.full_name = 'personal/side-project';
+        payload.comment.body = '`agent:sdd` side wake';
         return payload;
       },
     });

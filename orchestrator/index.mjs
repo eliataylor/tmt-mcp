@@ -35,7 +35,7 @@ import {
   isMentionHelpAction,
   isTestAction,
   isTriageAction,
-  listGraphicAllowedPaths,
+  listWireframeAllowedPaths,
   listStageFolderInventory,
   listWireframePaths,
   MENTION_HELP_MARKER,
@@ -710,13 +710,13 @@ async function publishArtifactRevision({
   }
   if (fileText !== null) await refuseIfLeak(fileText, needles, { label, issueNumber });
 
-  const graphic =
+  const wireframeAllowedPaths =
     kind === ARTIFACT_KINDS.UX && project
-      ? listGraphicAllowedPaths({ clonePath, project, issueNumber })
+      ? listWireframeAllowedPaths({ clonePath, project, issueNumber })
       : null;
 
-  if (graphic?.length) {
-    for (const path of graphic) {
+  if (wireframeAllowedPaths?.length) {
+    for (const path of wireframeAllowedPaths) {
       if (path === artifactPath) continue;
       let companion = null;
       try {
@@ -739,7 +739,7 @@ async function publishArtifactRevision({
     logger,
     kind,
     revertOthers,
-    allowedPaths: graphic,
+    allowedPaths: wireframeAllowedPaths,
   });
 
   let summary = null;
@@ -810,7 +810,11 @@ async function commentPreviewUrl(ctx, { gh, owner, repo, issueNumber, branch, cl
   if (!preview.enabled || action !== ACTIONS.EXECUTE) return;
 
   try {
-    const sha = await readPushedSha({ clonePath, branch });
+    const sha = await readPushedSha({
+      clonePath,
+      branch,
+      githubToken: ctx.config.secrets.GITHUB_TOKEN,
+    });
     if (!sha) {
       logger.warn(`[Task] ${label} could not read the pushed commit; skipping the preview comment`);
       return;

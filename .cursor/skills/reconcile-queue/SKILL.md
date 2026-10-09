@@ -7,7 +7,7 @@ description: After a tunnel or orchestrator outage, list recent GitHub issue eve
 
 ## When to use
 
-The webhook path is event-driven. If cloudflared or the queue was down, GitHub may have failed deliveries (redeliver in **Settings → Webhooks → Recent Deliveries**) or humans may have left control labels on issues with no matching task.
+The webhook path is event-driven. If cloudflared or the queue was down, GitHub may have failed deliveries (redeliver in **Settings → Webhooks → Recent Deliveries**) or humans may have left wake tokens in comments with no matching task.
 
 ## Prerequisites
 
@@ -40,9 +40,10 @@ npm run reconcile -- --comments
 
 1. **`--enqueue <row#>`** — `POST /api/agent/ingest` on the control listener when the image includes that route; otherwise the script enqueues via the host-mounted `sqlite_data/*/agent_queue.db` (same `handleDelivery` path). Rebuild `webhook-server` if you want HTTP-only ingest.
 2. **GitHub redelivery** — use when the original delivery still appears in Recent Deliveries; dedupes on `X-GitHub-Delivery`.
-3. **Manual** — toggle a control label, or comment with the project `mention` plus a control-label token (e.g. `@tmt-agent agent:sdd …`). A bare mention with no token and no control label on the issue queues `mention_help` only.
+3. **Manual** — ensure `agent_login` is assigned, then comment with a backticked control token (e.g. `` `agent:sdd` … ``). A bare mention with no token (or a token without assignee) queues `mention_help` only.
 
 ## Limits
 
 - Scans **open issues updated since `--since`** (default `72h`), then issue events and comments in that window. Very old activity on stale open issues may not appear until the issue is touched or you widen `--since`.
 - Does not replace GitHub’s delivery log for exact webhook replay.
+- Label/assign events never wake; reconcile rows that only flipped labels are expected to show `—`.

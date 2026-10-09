@@ -1,4 +1,6 @@
 node_modules/
+inspector/node_modules/
+inspector/dist/
 
 # Secrets — never commit. Only .env.example belongs in git.
 .env

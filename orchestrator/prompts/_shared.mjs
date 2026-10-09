@@ -22,7 +22,7 @@ export function controlLabels(project) {
     project.execute_label || 'agent:execute',
     project.triage_label || 'agent:triage',
     project.research_label || 'agent:research',
-    project.graphic_label || 'agent:graphic',
+    project.wireframe_label || 'agent:wireframe',
     project.monitor_label || 'agent:monitor',
     project.test_label || 'agent:test',
   ];
@@ -67,7 +67,7 @@ export function artifactFileRules({ artifactPath, executeLabel, controlList }) {
     `1. **No product code changes** — the only file you may edit is \`/workspace/${artifactPath}\`. Do not install dependencies beyond what reading the tree needs.`,
     '2. **No git writes** — do not commit, push, or open a PR. When you exit, the orchestrator commits this file as its own revision, upserts the sticky issue card, and links that version. Edits anywhere else are reverted.',
     '3. Stay inside `/workspace` for read-only exploration (search, read files, `git log`, `git diff`).',
-    `4. Do not add or remove GitHub labels yourself. Never touch control labels (${controlList}). Humans apply \`${executeLabel}\` when they want code.`,
+    `4. Do not add or remove GitHub labels yourself. Never touch control labels (${controlList}). Humans wake execute by commenting \`${executeLabel}\` while you are assigned.`,
     '5. Do **not** post or edit the sticky issue card (`<!-- tmt:card:… -->`). The orchestrator mirrors this file into that comment.',
     '6. Fill in the `<!-- summary: ... -->` line with one sentence on what this revision says or changed.',
     '7. Put numbered human asks under `## Needs from you` (or write "None").',

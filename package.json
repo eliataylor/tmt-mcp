@@ -16,7 +16,8 @@
     "orchestrator:dry-run": "node scripts/dry-run-task.mjs",
     "runner:build": "docker build -f docker/agent-runner.Dockerfile -t tmt-agent-runner .",
     "gc": "node scripts/gc-agent-artifacts.mjs",
-    "reconcile": "node scripts/reconcile-events.mjs"
+    "reconcile": "node scripts/reconcile-events.mjs",
+    "inspector": "npm --prefix inspector run dev"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",

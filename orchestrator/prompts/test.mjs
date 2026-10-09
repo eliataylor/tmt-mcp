@@ -19,7 +19,7 @@ export function renderTestSections({
     '1. **No product code changes.** Do not implement features or fix bugs in this mode.',
     `2. Edit only the **Results** section of \`/workspace/${testPath}\`. Leave Instructions alone.`,
     '3. **No git writes** from you — the orchestrator commits Results and upserts the sticky TEST card.',
-    `4. Do not add or remove labels (${controlList}).`,
+    `4. Do not add or remove labels (${controlList}). Humans re-run this mode by commenting \`${project.test_label || 'agent:test'}\` while you are assigned.`,
     '5. Do not post or edit sticky `<!-- tmt:card:… -->` comments.',
     testExists
       ? `6. Read Instructions in \`${testPath}\` and run what they ask (unit / e2e / both). Prefer these allowlisted commands when they match:\n${cmds}`

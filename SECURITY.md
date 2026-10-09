@@ -85,15 +85,16 @@ retry does not open a second task.
 
 Who may enqueue is decided in `src/triggers.mjs` from fields GitHub signed:
 
-- Comments and newly opened issues require `author_association` of `OWNER`, `MEMBER`, or
+- Only `issues.opened` and `issue_comment.created` can wake a run. Label, assign, unlabel, and
+reopen events are ignored for wake and cancel (cancel is issue closed only).
+- Opened issues and comments require `author_association` of `OWNER`, `MEMBER`, or
 `COLLABORATOR`.
-- Label and assign events are accepted when GitHub delivered them for someone who can edit the
-issue. A sender association of `NONE` is still rejected. A missing association is accepted,
-because GitHub only emits those events for users who can already edit.
-- Comments and labels from `user.type === Bot`, or from `agent_login`, are ignored so a plan
-comment or a triage label cannot start another run. That depends on the token posting as the
-agent. A shared personal token posts as you; setting `agent_login` to your own login would
-also drop your comments.
+- The issue must already list `agent_login` as an assignee, and the opening body or comment
+must contain a backticked control token (e.g. `` `agent:sdd` ``). Assign alone does not start
+work.
+- Comments from `user.type === Bot`, or from `agent_login`, are ignored so the agent cannot
+answer itself. That depends on the token posting as the agent. A shared personal token posts
+as you; setting `agent_login` to your own login would also drop your comments.
 
 The tunnel hostname is not a secret. Quick-tunnel names are scanned. The HMAC is what keeps a
 scanner from writing to the queue.
@@ -327,7 +328,8 @@ ranges, and the VM.
 - The GitHub token is not in the runner, not in remote URLs, and not in `docker inspect`.
 - The Neon API key and the poll secret are refused at the secrets file.
 - Host git does not run hooks from a worktree the agent can edit.
-- Triage cannot push, and it cannot label itself into execute: its own label events are ignored.
+- Triage cannot push. Label events never wake a run; only a backticked control token in an
+opened body or comment (with the agent assigned) does.
 - Plan publication, preview comments, and issue or pull-request comments posted through the
 proxy are refused when they contain a tracked secret, a database URL part, or the canary.
 

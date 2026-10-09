@@ -15,6 +15,7 @@
       "default_branch": "main",
       "trigger_label": "agent:sdd",
       "mention": "@dev-agent",
+      "agent_login": "dev-agent",
       "webhook_secret_env": "WEBHOOK_SECRET_SIDE_PROJECT"
     }
   ]

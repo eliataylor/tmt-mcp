@@ -23,7 +23,7 @@ export function renderExecuteSections({
     '5. Never commit `.env.local` or any secret. It is gitignored — leave it that way.',
     '6. Stay inside `/workspace`. Do not try to reach the host or other containers.',
     '7. If the thread changed materially since the plan — a new blocker, a revised approach — post a brief issue comment before your first edit. Otherwise proceed.',
-    `8. Do not add or remove labels (${controlList}). A human decides what state this issue is in.`,
+    `8. Do not add or remove labels (${controlList}). A human wakes the next stage with a backticked control token in a comment while you are assigned.`,
     `9. Commit in logical steps and push to \`origin ${branch}\` when done.`,
     prNumber
       ? `10. Summarize what you changed as a comment on PR #${prNumber} when finished.`

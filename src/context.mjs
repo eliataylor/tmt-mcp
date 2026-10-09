@@ -53,7 +53,7 @@ export function buildContext({ event, action, payload, project, deliveryId = nul
       execute_label: project.execute_label,
       triage_label: project.triage_label,
       research_label: project.research_label,
-      graphic_label: project.graphic_label,
+      wireframe_label: project.wireframe_label,
       monitor_label: project.monitor_label,
       test_label: project.test_label,
       mention: project.mention,

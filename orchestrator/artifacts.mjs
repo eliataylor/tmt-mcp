@@ -42,6 +42,7 @@ export function isArtifactAction(action) {
     action === ACTIONS.OPENED ||
     action === ACTIONS.COMMENT ||
     action === ACTIONS.RESEARCH ||
+    action === ACTIONS.WIREFRAME ||
     action === ACTIONS.GRAPHIC ||
     action === ACTIONS.MONITOR
   );
@@ -69,26 +70,28 @@ export function needsTaskBranch(action) {
 }
 
 /**
- * Sticky comment explaining how to wake the agent with a mention.
+ * Sticky comment explaining how to wake the agent (assignee + backticked control token).
  * @param {{ project: object }} opts
  */
 export function renderMentionHelpComment({ project }) {
-  const mention = project.mention || (project.agent_login ? `@${project.agent_login}` : '@agent');
+  const login = project.agent_login || 'agent';
   const labels = configuredControlLabels(project);
   const labelList = labels.map((name) => `\`${name}\``).join(', ');
-  const example = labels[0] || 'agent:sdd';
+  const example = labels.includes(project.trigger_label || 'agent:sdd')
+    ? project.trigger_label || 'agent:sdd'
+    : labels[0] || 'agent:sdd';
   return [
     MENTION_HELP_MARKER,
     '',
-    'To wake me with a mention, include a control label in the same comment (or put that label on the issue):',
+    `To wake me: **assign \`${login}\`** on this issue, then put a backticked control token in the issue body (on open) or in a new comment:`,
     '',
     '```',
-    `${mention} ${example} …`,
+    `\`${example}\` …`,
     '```',
     '',
-    `Configured labels: ${labelList || '_(none configured)_'}.`,
+    `Configured tokens: ${labelList || '_(none configured)_'}.`,
     '',
-    'Preference: label string in the mentioning text → control label already on the issue → this help.',
+    'GitHub labels and assign events do not start a run. Closing the issue cancels pending work.',
   ].join('\n');
 }
 
@@ -101,6 +104,7 @@ export function artifactKindForAction(action) {
   switch (action) {
     case ACTIONS.RESEARCH:
       return ARTIFACT_KINDS.RESEARCH;
+    case ACTIONS.WIREFRAME:
     case ACTIONS.GRAPHIC:
       return ARTIFACT_KINDS.UX;
     case ACTIONS.SDD:
@@ -182,10 +186,10 @@ export function listWireframePaths({ clonePath, project, issueNumber }) {
 }
 
 /**
- * Paths graphic mode may keep when committing a revision: UX.md plus every `.drawio`
+ * Paths wireframe mode may keep when committing a revision: UX.md plus every `.drawio`
  * currently on disk under wireframes/.
  */
-export function listGraphicAllowedPaths({ clonePath, project, issueNumber }) {
+export function listWireframeAllowedPaths({ clonePath, project, issueNumber }) {
   const uxPath = resolveArtifactRelativePath(project, issueNumber, ARTIFACT_KINDS.UX);
   return [uxPath, ...listWireframePaths({ clonePath, project, issueNumber })];
 }

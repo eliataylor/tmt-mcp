@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 
 import {
   ARTIFACT_KINDS,
-  listGraphicAllowedPaths,
+  listWireframeAllowedPaths,
   listStageFolderInventory,
   listWireframePaths,
   renderArtifactCard,
@@ -36,7 +36,7 @@ function sh(cwd, ...args) {
 }
 
 function makeClone() {
-  const root = mkdtempSync(join(tmpdir(), 'graphic-test-'));
+  const root = mkdtempSync(join(tmpdir(), 'wireframe-test-'));
   const remote = join(root, 'remote.git');
   const clone = join(root, 'clone');
   execFileSync('git', ['init', '-q', '--bare', '-b', 'main', remote]);
@@ -59,7 +59,7 @@ const issueContext = {
     number: 42,
     title: 'Wireframe the match card',
     author: 'alice',
-    labels: ['agent:graphic'],
+    labels: ['agent:wireframe'],
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
     url: 'https://github.com/my-org/primary-app/issues/42',
@@ -99,7 +99,7 @@ describe('stage folder inventory', () => {
     assert.match(section, /home\.drawio/);
   });
 
-  test('listGraphicAllowedPaths includes UX.md and every .drawio', () => {
+  test('listWireframeAllowedPaths includes UX.md and every .drawio', () => {
     const { clone } = makeClone();
     mkdirSync(join(clone, '.agent/plans/42/wireframes'), { recursive: true });
     writeFileSync(join(clone, '.agent/plans/42/UX.md'), '# Wireframes\n');
@@ -107,7 +107,7 @@ describe('stage folder inventory', () => {
     writeFileSync(join(clone, '.agent/plans/42/wireframes/b.drawio'), DRAWIO);
     writeFileSync(join(clone, '.agent/plans/42/wireframes/notes.txt'), 'ignore');
 
-    assert.deepEqual(listGraphicAllowedPaths({ clonePath: clone, project: PROJECT, issueNumber: 42 }), [
+    assert.deepEqual(listWireframeAllowedPaths({ clonePath: clone, project: PROJECT, issueNumber: 42 }), [
       '.agent/plans/42/UX.md',
       '.agent/plans/42/wireframes/a.drawio',
       '.agent/plans/42/wireframes/b.drawio',
@@ -115,8 +115,8 @@ describe('stage folder inventory', () => {
   });
 });
 
-describe('graphic / cross-mode prompts', () => {
-  test('graphic mode asks for uncompressed draw.io wireframes', () => {
+describe('wireframe / cross-mode prompts', () => {
+  test('wireframe mode asks for uncompressed draw.io wireframes', () => {
     const inventory = listStageFolderInventory({
       clonePath: null,
       project: PROJECT,
@@ -126,8 +126,8 @@ describe('graphic / cross-mode prompts', () => {
       context: issueContext,
       branch: 'agent/issue-42',
       prNumber: 101,
-      action: 'agent:graphic',
-      taskId: 't-graphic',
+      action: 'agent:wireframe',
+      taskId: 't-wireframe',
       artifactPath: '.agent/plans/42/UX.md',
       artifactExists: true,
       stageInventory: inventory,
@@ -209,7 +209,7 @@ describe('graphic / cross-mode prompts', () => {
   });
 });
 
-describe('graphic publish allowlist', () => {
+describe('wireframe publish allowlist', () => {
   test('commits UX.md and .drawio; reverts stray product edits', async () => {
     const { clone } = makeClone();
     const ux = '.agent/plans/42/UX.md';
@@ -229,12 +229,12 @@ describe('graphic publish allowlist', () => {
     writeFileSync(join(clone, 'app.js'), 'console.log("tamper");\n');
     writeFileSync(join(clone, 'stray.txt'), 'nope\n');
 
-    const allowed = listGraphicAllowedPaths({ clonePath: clone, project: PROJECT, issueNumber: 42 });
+    const allowed = listWireframeAllowedPaths({ clonePath: clone, project: PROJECT, issueNumber: 42 });
     const result = await commitArtifactRevision({
       clonePath: clone,
       artifactPath: ux,
       issueNumber: 42,
-      taskId: 'task-graphic-1',
+      taskId: 'task-wireframe-1',
       branch: 'agent/issue-42',
       headBefore,
       logger: quiet,

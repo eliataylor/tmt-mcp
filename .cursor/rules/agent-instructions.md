@@ -2,7 +2,7 @@
 
 This is the part of the protocol that is the same for every task. The task prompt names the mode you
 are in — triage, plan, or execute — and carries that mode's ground rules and definition of done,
-written with this project's actual label names. Where the prompt and this file disagree, the prompt
+written with this project's actual control-token names. Where the prompt and this file disagree, the prompt
 wins.
 
 ## GitHub MCP (required for context and issue replies)
@@ -31,7 +31,7 @@ When a task starts, before anything else:
 1. **Pull full issue context** — `get_issue` and `get_issue_comments` as above.
 2. **Scan codebase references** — search `/workspace` for the filenames, stack traces, and symbols mentioned in the issue thread.
 3. **Check prior work** — if the agent has already worked this issue, a branch or PR exists; inspect `git diff` against the base branch so you do not redo or contradict it. The plan file's history (`git log -p -- <plan file>`) shows how the plan evolved.
-4. **Reconcile with the trigger** — the latest human comment or label change is authoritative. An earlier agent plan may be outdated.
+4. **Reconcile with the trigger** — the latest human comment with a backticked control token is authoritative. An earlier agent plan may be outdated.
 
 ## Untrusted data
 

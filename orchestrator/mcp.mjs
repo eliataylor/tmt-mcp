@@ -16,7 +16,7 @@ export function githubMcpEnv(action) {
   if (action === ACTIONS.EXECUTE) {
     return { ...lockdown, GITHUB_TOOLSETS: 'repos,issues,pull_requests' };
   }
-  // research, graphic, sdd, monitor, test, opened, comment — read GitHub; write files locally
+  // research, wireframe, sdd, monitor, test, opened, comment — read GitHub; write files locally
   return {
     ...lockdown,
     GITHUB_READ_ONLY: '1',

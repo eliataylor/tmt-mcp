@@ -92,75 +92,74 @@ docker compose kill -s HUP webhook-server
 | ---------------------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `plan_folder`                                        | `.agent/plans`                                       | Root for per-issue stage files at `{plan_folder}/{n}/PLAN.md` (and RESEARCH, UX, TEST, MONITOR). Must be tracked — gitignored folders make revision commits empty. |
 | `webhook_secret_env`                                 | —                                                    | Required. HMAC is checked against that variable only. There is no shared `GITHUB_WEBHOOK_SECRET`. An unset variable fails closed.                                  |
-| `trigger_label`                                      | `agent:sdd`                                          | System Design / PLAN.md. Also the cancel label when removed.                                                                                                       |
-| `execute_label`                                      | `agent:execute`                                      | Implement from PLAN.md; write TEST.md Instructions.                                                                                                                |
-| `test_label`                                         | `agent:test`                                         | Re-run tests; write TEST.md Results.                                                                                                                               |
-| `triage_label`                                       | `agent:triage`                                       | Triage mode.                                                                                                                                                       |
-| `research_label` / `graphic_label` / `monitor_label` | `agent:research` / `agent:graphic` / `agent:monitor` | Optional stage files.                                                                                                                                              |
+| `trigger_label`                                      | `agent:sdd`                                          | System Design / PLAN.md token string (`` `agent:sdd` `` in body/comment).                                                          |
+| `execute_label`                                      | `agent:execute`                                      | Implement from PLAN.md; write TEST.md Instructions.                                                                                |
+| `test_label`                                         | `agent:test`                                         | Re-run tests; write TEST.md Results.                                                                                               |
+| `triage_label`                                       | `agent:triage`                                       | Triage mode.                                                                                                                       |
+| `research_label` / `wireframe_label` / `monitor_label` | `agent:research` / `agent:wireframe` / `agent:monitor` | Optional stage files.                                                                                                              |
 
 
 
-| Delivery                                 | Result                                                                                                                                             |
-| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Comment, or `issues.opened` / `reopened` | Queued only when `author_association` is `OWNER`, `MEMBER`, or `COLLABORATOR`.                                                                     |
-| `issues.labeled` / `issues.assigned`     | Accepted: GitHub only delivers these for someone who can edit the issue. Sender association `NONE` is rejected. A missing association is accepted. |
-| Repo not in the registry                 | `202`, logged, never queued. Not configurable.                                                                                                     |
-| No trigger matched                       | `200` `{ "ignored": true }`, so GitHub does not retry.                                                                                             |
+| Delivery                 | Result                                                                                         |
+| ------------------------ | ---------------------------------------------------------------------------------------------- |
+| `issues.opened`, comment | Queued only when `author_association` is `OWNER`, `MEMBER`, or `COLLABORATOR`.                 |
+| Repo not in the registry | `202`, logged, never queued. Not configurable.                                                 |
+| No trigger matched       | `200` `{ "ignored": true }`, so GitHub does not retry.                                         |
 
 
 
 
 ### What becomes a task
 
-Priority when several labels are present: **execute → test → sdd → research / graphic / monitor → triage**.
+Wake only from **text**: a backticked control token in the issue body (`issues.opened`) or a new comment. The agent must already be an **assignee**. GitHub labels and assign events do not start a run. `issues.reopened` is ignored (post a new comment with a token).
+
+When several backticked tokens appear, prefer the **earliest Status stage**: triage → research → wireframe → sdd → execute → test → monitor.
 
 
-| Event                        | Condition                                      | Result                                                                                                                           |
-| ---------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `issues.labeled`             | applied by the agent itself                    | ignored — triage applies labels, and they must not re-trigger it                                                                 |
-| `issues.labeled`             | stage / execute / test / triage label          | queue that mode (`agent:sdd`, `agent:research`, `agent:graphic`, `agent:monitor`, `agent:execute`, `agent:test`, `agent:triage`) |
-| `issues.assigned`            | assignee matches `agent_login`                 | queue `agent:sdd`                                                                                                                |
-| `issues.opened` / `reopened` | carries a control label, no agent mention      | queue that mode (`agent:opened` when only `trigger_label` / sdd)                                                                 |
-| `issues.opened` / `reopened` | body mentions agent                            | Action from text token → issue control labels → sticky `mention_help` (never a silent SDD default)                               |
-| `issue_comment.created`      | author is a `Bot`, or matches `agent_login`    | ignored — the agent must not answer itself                                                                                       |
-| `issue_comment.created`      | mentions agent                                 | same preference: text token (e.g. `@agent agent:research …`) → issue labels → sticky `mention_help`                              |
-| `issue_comment.created`      | no mention; revisable stage/execute/test label | queue that mode (`comment_created` when only sdd)                                                                                |
-| `issues.closed`              | —                                              | cancel that issue's pending tasks                                                                                                |
-| `issues.unlabeled`           | label matches `trigger_label`                  | cancel that issue's pending tasks                                                                                                |
+| Event                   | Condition                                                     | Result                                                                                                      |
+| ----------------------- | ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `issues.opened`         | body has `` `agent:…` `` and `agent_login` is assigned        | queue that mode                                                                                             |
+| `issues.opened`         | body has token but agent not assigned, or bare mention        | sticky `mention_help` (no runner)                                                                           |
+| `issues.reopened`       | —                                                             | ignored — comment with a backticked token                                                                   |
+| `issues.labeled` / `unlabeled` / `assigned` | —                                           | ignored                                                                                                     |
+| `issue_comment.created` | author is a `Bot`, or matches `agent_login`                   | ignored — the agent must not answer itself                                                                  |
+| `issue_comment.created` | comment has `` `agent:…` `` and agent assigned                | queue that mode                                                                                             |
+| `issue_comment.created` | token without assignee, or bare mention without token         | sticky `mention_help`                                                                                       |
+| `issues.closed`         | —                                                             | cancel that issue's pending tasks                                                                           |
 
 
-**Mentions:** include a control-label string in the commenting (or issue) body, or put that label on the issue. Preference is **text token → issue labels → help**. The orchestrator upserts a sticky `<!-- tmt:mention-help -->` card when neither signal is present; it does not start the agent runner.
+**Wake gesture:** assign `agent_login`, then include a backticked token in the open body or a comment, e.g. `` `agent:research` dig into conversion ``. No `@mention` required. The orchestrator upserts a sticky `<!-- tmt:mention-help -->` card when the gesture is incomplete.
 
-Removing `execute_label` / `test_label` / stage labels other than `trigger_label` does not cancel queued work. Pending tasks cancel when the issue closes or loses `trigger_label`.
-
-
-| Loop guard                                               | Why it matters                                                                                                                  |
-| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| Sticky cards stay on the issue while stage labels remain | `Bot` and `agent_login` comments are ignored, which is what stops the agent answering itself.                                   |
-| `GITHUB_TOKEN` must be the agent's                       | A personal token posts as you. Setting `agent_login` to that login drops your comments too. Use a machine user or a GitHub App. |
+Pending tasks cancel when the issue **closes**. Removing labels does not cancel.
 
 
-**Typical flow:** `agent:triage` (optional) → optional `agent:research` / `agent:graphic` → `agent:sdd` writes `.agent/plans/{n}/PLAN.md` → sticky card on the issue → human adds `agent:execute` → product code + TEST Instructions → preview → `agent:test` re-runs checks → optional `agent:monitor` after ship.
+| Loop guard                         | Why it matters                                                                                                                  |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Agent comments are ignored         | `Bot` and `agent_login` comments are ignored, which is what stops the agent answering itself.                                   |
+| `GITHUB_TOKEN` must be the agent's | A personal token posts as you. Setting `agent_login` to that login drops your comments too. Use a machine user or a GitHub App. |
+
+
+**Typical flow:** assign agent → comment `` `agent:triage` `` (optional) → optional `` `agent:research` `` / `` `agent:wireframe` `` → `` `agent:sdd` `` writes `.agent/plans/{n}/PLAN.md` → sticky card → human comments `` `agent:execute` `` → product code + TEST Instructions → preview → `` `agent:test` `` → optional `` `agent:monitor` `` after ship.
 
 ### Modes
 
 
-| Mode              | Label            | Deliverable                                      | Writes                                                  |
-| ----------------- | ---------------- | ------------------------------------------------ | ------------------------------------------------------- |
-| **Triage**        | `agent:triage`   | Estimate + related issues/files                  | 1 short comment (no `.agent/plans`)                     |
-| **Research**      | `agent:research` | `.agent/plans/{n}/RESEARCH.md`                   | 1 file commit + sticky card                             |
-| **Wireframes**    | `agent:graphic`  | `.agent/plans/{n}/UX.md` + `wireframes/*.drawio` | UX.md + draw.io files + sticky card                     |
-| **System design** | `agent:sdd`      | `.agent/plans/{n}/PLAN.md` (execute SoT)         | 1 file commit + sticky card                             |
-| **Execute**       | `agent:execute`  | Product code + TEST.md Instructions              | Agent commits product; orchestrator publishes TEST card |
-| **Test**          | `agent:test`     | TEST.md Results                                  | 1 file commit + sticky card                             |
-| **Monitor**       | `agent:monitor`  | `.agent/plans/{n}/MONITOR.md`                    | 1 file commit + sticky card                             |
+| Mode              | Token (backticked) | Deliverable                                      | Writes                                                  |
+| ----------------- | ------------------ | ------------------------------------------------ | ------------------------------------------------------- |
+| **Triage**        | `agent:triage`     | Estimate + related issues/files                  | 1 short comment (no `.agent/plans`)                     |
+| **Research**      | `agent:research`   | `.agent/plans/{n}/RESEARCH.md`                   | 1 file commit + sticky card                             |
+| **Wireframes**    | `agent:wireframe`    | `.agent/plans/{n}/UX.md` + `wireframes/*.drawio` | UX.md + draw.io files + sticky card                     |
+| **System design** | `agent:sdd`        | `.agent/plans/{n}/PLAN.md` (execute SoT)         | 1 file commit + sticky card                             |
+| **Execute**       | `agent:execute`    | Product code + TEST.md Instructions              | Agent commits product; orchestrator publishes TEST card |
+| **Test**          | `agent:test`       | TEST.md Results                                  | 1 file commit + sticky card                             |
+| **Monitor**       | `agent:monitor`    | `.agent/plans/{n}/MONITOR.md`                    | 1 file commit + sticky card                             |
 
 
 Mode ground rules live under `[orchestrator/prompts/](orchestrator/prompts/)`; `[orchestrator/prompt.mjs](orchestrator/prompt.mjs)` assembles the shared framing. `[.cursor/rules/agent-instructions.md](.cursor/rules/agent-instructions.md)` is inlined into every mode.
 
 ### Dual surface (file + sticky card)
 
-Stage markdown (and graphic-mode `wireframes/*.drawio`) on the branch is the source of truth. Every non-triage prompt includes an orchestrator-built **Stage folder** inventory of present/missing siblings so research, wireframes, SDD, and execute can read each other. After each revision the orchestrator **upserts** one sticky issue comment per kind (`<!-- tmt:card:PLAN -->`, etc.): visible summary + Needs from you, full file in a collapsed `<details>` block. Zero extra model tokens — the card is built from the file. Next runs should read the file, not the card.
+Stage markdown (and wireframe-mode `wireframes/*.drawio`) on the branch is the source of truth. Every non-triage prompt includes an orchestrator-built **Stage folder** inventory of present/missing siblings so research, wireframes, SDD, and execute can read each other. After each revision the orchestrator **upserts** one sticky issue comment per kind (`<!-- tmt:card:PLAN -->`, etc.): visible summary + Needs from you, full file in a collapsed `<details>` block. Zero extra model tokens — the card is built from the file. Next runs should read the file, not the card.
 
 ### Stage / System Design mode
 
@@ -168,7 +167,7 @@ Stage markdown (and graphic-mode `wireframes/*.drawio`) on the branch is the sou
 | Step              | Who          | What                                                                                                                                      |
 | ----------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | Branch + draft PR | orchestrator | First commit scaffolds the waking stage file under `.agent/plans/{n}/`.                                                                   |
-| Edit              | agent        | That stage's allowlist only (usually one markdown file; graphic also writes `wireframes/*.drawio`). No commit/push; no sticky-card edits. |
+| Edit              | agent        | That stage's allowlist only (usually one markdown file; wireframe also writes `wireframes/*.drawio`). No commit/push; no sticky-card edits. |
 | Commit            | orchestrator | Revert other uncommitted edits; commit allowlisted paths; push.                                                                           |
 | Issue card        | orchestrator | Upsert sticky comment (summary, asks, collapsed body, permalink).                                                                         |
 | Later execute     | agent        | PLAN.md is the plan of record; consult UX/wireframes when present; also write TEST.md Instructions.                                       |
@@ -199,12 +198,12 @@ Read the thread and the code, post one short comment with a rough estimate and a
 | Estimate           | Rough implementation time for one engineer who knows the codebase (`2-4h`, `1-2d`, or `unknown`).                                               |
 | Related            | Bare `#<number>` when a file, route, or flow is shared. GitHub records the back-reference. The agent does not comment on the other issue.       |
 | Files              | Paths in the checkout that clearly belong to this work.                                                                                         |
-| One-shot           | A later comment does not re-triage. Add `agent:sdd` (or another stage label) when the issue deserves design work.                               |
+| Re-run             | Comment `` `agent:triage` `` again while the agent is assigned.                                                                                  |
 | No push            | `remote.origin.pushurl` is `read-only://triage-tasks-do-not-push` (no git transport). Fetch URL stays HTTPS so tooling can still name the repo. |
-| No self-escalation | Control labels stay off-limits, and `issues.labeled` from the agent is ignored.                                                                 |
+| No self-escalation | Control tokens stay off-limits for the agent to invent; only triage may apply ordinary (non-control) labels.                                    |
 
 
-Push URL and ignored agent label events: [SECURITY.md](SECURITY.md#runner-sandbox), [SECURITY.md](SECURITY.md#admitting-work).
+Push URL and admitting work: [SECURITY.md](SECURITY.md#runner-sandbox), [SECURITY.md](SECURITY.md#admitting-work).
 
 ## Task context
 
@@ -336,7 +335,7 @@ The loop is `setTimeout`, so a slow poll cannot overlap the next tick, and it po
 | PR            | Plan-scaffold commit, push, draft PR (a normal PR when drafts are rejected), issue comment linking the PR and the plan file                                                                                                                                                                                                                                                                                                                                                                                | skipped                                           |
 | Neon          | Projects with a `neon` block get an ephemeral branch off `parent_branch` and a `DATABASE_URL` in `.env.local`                                                                                                                                                                                                                                                                                                                                                                                              | skipped                                           |
 | Run           | The container, in a Herdr pane when Herdr is up                                                                                                                                                                                                                                                                                                                                                                                                                                                            | yes                                               |
-| Relay         | `/out/result.json` selects `complete` or `fail`. A heartbeat every `HEARTBEAT_INTERVAL_SECONDS` extends the lease. Status `canceled` (issue closed, or `trigger_label` removed) stops the container.                                                                                                                                                                                                                                                                                                       | yes                                               |
+| Relay         | `/out/result.json` selects `complete` or `fail`. A heartbeat every `HEARTBEAT_INTERVAL_SECONDS` extends the lease. Status `canceled` (issue closed) stops the container.                                                                                                                                                                                                                                                                                                       | yes                                               |
 | Plan revision | [Plan mode](#plan-mode)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | skipped                                           |
 | Preview       | Execute only. [Preview comments](#preview-comments)                                                                                                                                                                                                                                                                                                                                                                                                                                                        | skipped                                           |
 
@@ -357,7 +356,7 @@ No Vercel API key and no project ids in `config/orchestrator.json`. A host that 
 
 | Rule                     | Behavior                                                                                                                           |
 | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
-| Lookup                   | The pushed commit, not the branch. A resumed issue keeps older deployments.                                                        |
+| Lookup                   | Tip of the branch on origin (`git ls-remote`), not a stale local tracking ref. Deployments are filtered by that SHA.               |
 | `PREVIEW_GRACE_MS`       | How long to wait for a deployment record. A repo with no hosting is dropped here.                                                  |
 | `PREVIEW_TIMEOUT_MS`     | How long to wait for a final state. A build still running is commented with its state; the branch URL will serve it when it lands. |
 | Failure                  | Commented, with a link to the log.                                                                                                 |
@@ -399,6 +398,19 @@ Optional PostHog MCP: a [personal API key](https://posthog.com/docs/api/personal
 `.cursor/mcp.json` points the SQLite MCP server at `sqlite_data/`. Treat that as a debugging convenience. The container holds the file open in WAL mode across a Docker Desktop bind mount, and WAL coordinates readers through a `-shm` file that does not cross the macOS VM boundary reliably. Host-side reads can be stale or hit locking errors.
 
 **Use** `GET /api/agent/tasks` **for anything that matters.** Tunnel probes are `GET /api/agent/access`.
+
+### Local inspector UI
+
+A read-only React app under `inspector/` loads the SQLite file into the browser (sql.js) — no auth, binds to `127.0.0.1` only, no outbound network.
+
+```bash
+npm run inspector
+# http://127.0.0.1:5173
+```
+
+Open `sqlite_data/shared/agent_queue.db` via **Open file**, or **Load default** (Vite serves that path locally). Shared `from` / `to` URL params filter every view. Routes: `/tasks`, `/agg/by-author`, `/agg/by-action`, `/tunnel/hits`, `/tunnel/ips`.
+
+Token rollups use the latest `token_usage` per task (overwritten each attempt). Reloading the file is how you refresh; WAL-only writes may not appear until checkpointed. Comfortable while the DB stays under ~50–100MB in memory.
 
 ## Environment
 

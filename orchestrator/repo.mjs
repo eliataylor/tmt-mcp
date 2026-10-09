@@ -391,7 +391,7 @@ export async function commitPlanRevision(opts) {
  *
  * @param {object} opts
  * @param {string[]|null} [opts.allowedPaths] when set, stage every existing path in the list and
- *   revert everything outside it (e.g. graphic: UX.md + wireframes/*.drawio).
+ *   revert everything outside it (e.g. wireframe: UX.md + wireframes/*.drawio).
  */
 export async function commitArtifactRevision({
   clonePath,
@@ -478,14 +478,22 @@ export async function pushBranch({ clonePath, branch, githubToken = null }) {
 }
 
 /**
- * The commit GitHub actually has for this branch, which is what any deployment was built from.
+ * The commit the remote actually has for this branch — what any deployment was built from.
  *
- * Not the same as local HEAD: the agent pushes from inside the container against this very clone,
- * so the remote-tracking ref is current, but it may also have committed without pushing. HEAD is
- * the fallback only for the case where the branch was never pushed at all.
+ * Do not trust `refs/remotes/origin/<branch>` alone: the agent pushes from inside the container,
+ * and that push does not reliably update the host's remote-tracking ref. After #198-style runs the
+ * tracking ref can still be the pre-execute tip while GitHub (and Vercel) have the new SHA.
+ * `ls-remote` asks origin; local tracking / HEAD are fallbacks when the remote cannot be reached.
  */
-export async function readPushedSha({ clonePath, branch }) {
-  const g = git(clonePath);
+export async function readPushedSha({ clonePath, branch, githubToken = null }) {
+  const g = git(clonePath, { githubToken });
+  try {
+    const line = await g.capture(['ls-remote', '--heads', 'origin', `refs/heads/${branch}`]);
+    const sha = (line.split(/\s+/)[0] || '').trim();
+    if (/^[0-9a-f]{40}$/i.test(sha)) return sha.toLowerCase();
+  } catch {
+    // Offline / auth / missing remote — fall through to local refs.
+  }
   for (const rev of [`refs/remotes/origin/${branch}`, 'HEAD']) {
     try {
       return await g.capture(['rev-parse', rev]);

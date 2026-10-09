@@ -19,7 +19,7 @@ export const PROJECT = {
   execute_label: 'agent:execute',
   triage_label: 'agent:triage',
   research_label: 'agent:research',
-  graphic_label: 'agent:graphic',
+  wireframe_label: 'agent:wireframe',
   monitor_label: 'agent:monitor',
   test_label: 'agent:test',
   mention: '@dev-agent',
