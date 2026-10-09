@@ -2,9 +2,13 @@ import { readFileSync } from 'node:fs';
 
 export const DEFAULTS = {
   default_branch: 'main',
-  trigger_label: 'agent:assigned',
+  trigger_label: 'agent:sdd',
   execute_label: 'agent:execute',
   triage_label: 'agent:triage',
+  research_label: 'agent:research',
+  graphic_label: 'agent:graphic',
+  monitor_label: 'agent:monitor',
+  test_label: 'agent:test',
   mention: '@dev-agent',
   plan_folder: '.agent/plans',
 };
@@ -83,6 +87,10 @@ function normalizeProject(raw, index) {
     trigger_label: raw.trigger_label || DEFAULTS.trigger_label,
     execute_label: raw.execute_label || DEFAULTS.execute_label,
     triage_label: raw.triage_label || DEFAULTS.triage_label,
+    research_label: raw.research_label || DEFAULTS.research_label,
+    graphic_label: raw.graphic_label || DEFAULTS.graphic_label,
+    monitor_label: raw.monitor_label || DEFAULTS.monitor_label,
+    test_label: raw.test_label || DEFAULTS.test_label,
     mention: raw.mention || DEFAULTS.mention,
     plan_folder: normalizePlanFolder(raw.plan_folder, `${where} (${raw.slug}) "plan_folder"`),
     agent_login: raw.agent_login || null,

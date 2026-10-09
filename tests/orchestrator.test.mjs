@@ -59,7 +59,7 @@ function contextFor(name, { event, action }) {
 
 const issueContext = contextFor('issues.labeled.json', {
   event: 'issues',
-  action: 'agent:assigned',
+  action: 'agent:sdd',
 });
 
 describe('git URL resolution', () => {
@@ -201,9 +201,9 @@ describe('prompt rendering', () => {
     branch: 'agent/issue-42',
     prNumber: 101,
     prUrl: 'https://github.com/my-org/primary-app/pull/101',
-    action: 'agent:assigned',
+    action: 'agent:sdd',
     taskId: 'abc123def456',
-    planPath: '.agent/plans/PLAN-42.md',
+    planPath: '.agent/plans/42/PLAN.md',
     planExists: true,
   });
 
@@ -230,7 +230,7 @@ describe('prompt rendering', () => {
       context: issueContext,
       branch: 'agent/issue-42',
       prNumber: 101,
-      action: 'agent:assigned',
+      action: 'agent:sdd',
       taskId: 'abc123def456',
       canary: 'tmt-canary-0123456789abcdef0123456789abcdef',
     });
@@ -246,7 +246,7 @@ describe('prompt rendering', () => {
       },
       branch: 'agent/issue-1',
       prNumber: 1,
-      action: 'agent:assigned',
+      action: 'agent:sdd',
       taskId: 't',
     });
     // The literal delimiter only ever appears as the real open and close markers.
@@ -272,18 +272,18 @@ describe('prompt rendering', () => {
   });
 
   test('plan tasks forbid product code changes', () => {
-    assert.match(prompt, /Ground rules \(plan\)/);
+    assert.match(prompt, /Ground rules \(system design\)/);
     assert.match(prompt, /No product code changes/);
-    assert.match(prompt, /\*\*Plan\*\*/);
+    assert.match(prompt, /\*\*System design\*\*/);
   });
 
   // The orchestrator commits the plan so every run is exactly one revision; an agent that also
   // committed or pasted the plan into the thread would bring back the noise this replaces.
   test('plan tasks write only the plan file and leave git and the comment to the orchestrator', () => {
-    assert.match(prompt, /Plan file: `\/workspace\/\.agent\/plans\/PLAN-42\.md`/);
-    assert.match(prompt, /only file you may edit is `\/workspace\/\.agent\/plans\/PLAN-42\.md`/);
+    assert.match(prompt, /Stage file: `\/workspace\/\.agent\/plans\/42\/PLAN\.md`/);
+    assert.match(prompt, /only file you may edit is `\/workspace\/\.agent\/plans\/42\/PLAN\.md`/);
     assert.match(prompt, /No git writes/);
-    assert.match(prompt, /Do \*\*not\*\* post the plan as an issue comment/);
+    assert.match(prompt, /Do \*\*not\*\* post or edit the sticky issue card/);
     assert.match(prompt, /<!-- summary: \.\.\. -->/);
     assert.doesNotMatch(prompt, /## The plan comment/);
   });
@@ -295,11 +295,13 @@ describe('prompt rendering', () => {
       prNumber: 101,
       action: 'agent:execute',
       taskId: 't-exec-plan',
-      planPath: '.agent/plans/PLAN-42.md',
+      planPath: '.agent/plans/42/PLAN.md',
       planExists: true,
+      testPath: '.agent/plans/42/TEST.md',
+      testExists: true,
     });
-    assert.match(withPlan, /Follow the plan in `\.agent\/plans\/PLAN-42\.md`/);
-    assert.match(withPlan, /supersedes older plan comments/);
+    assert.match(withPlan, /Follow the plan in `\.agent\/plans\/42\/PLAN\.md`/);
+    assert.match(withPlan, /source of truth/);
 
     const legacy = buildPrompt({
       context: issueContext,
@@ -307,17 +309,19 @@ describe('prompt rendering', () => {
       prNumber: 101,
       action: 'agent:execute',
       taskId: 't-exec-legacy',
-      planPath: '.agent/plans/PLAN-42.md',
+      planPath: '.agent/plans/42/PLAN.md',
       planExists: false,
+      testPath: '.agent/plans/42/TEST.md',
+      testExists: false,
     });
-    assert.match(legacy, /Follow the plan the thread agreed on/);
-    assert.match(legacy, /not on this branch yet/);
+    assert.match(legacy, /No PLAN\.md is on this branch yet/);
+    assert.match(legacy, /Follow what the thread agreed on/);
   });
 
   // An agent that checks $DATABASE_URL finds nothing, because the URL is written to a file in the
   // clone. Without this section it concluded, reasonably and wrongly, that it had no database.
   describe('the database section', () => {
-    const withBranch = (overrides = {}, action = 'agent:assigned') =>
+    const withBranch = (overrides = {}, action = 'agent:sdd') =>
       buildPrompt({
         context: issueContext,
         branch: 'agent/issue-42',
@@ -383,7 +387,7 @@ describe('prompt rendering', () => {
         context: issueContext,
         branch: 'agent/issue-42',
         prNumber: 101,
-        action: 'agent:assigned',
+        action: 'agent:sdd',
         taskId: 't-no-db',
       });
       assert.match(noDb, /Database: none — this project has no database branch configured/);
@@ -402,16 +406,18 @@ describe('prompt rendering', () => {
 
     test('announce triage mode and no branch work', () => {
       assert.match(triagePrompt, /\*\*Triage\*\*/);
-      assert.match(triagePrompt, /Ground rules \(triage\)/);
+      assert.match(triagePrompt, /## Triage/);
       assert.match(triagePrompt, /No code changes/);
       assert.match(triagePrompt, /triage does not open one/);
-      assert.doesNotMatch(triagePrompt, /Ground rules \(plan\)/);
+      assert.doesNotMatch(triagePrompt, /Ground rules \(system design\)/);
       assert.doesNotMatch(triagePrompt, /Ground rules \(execute\)/);
     });
 
     test('forbid the control labels that would escalate the issue', () => {
-      assert.match(triagePrompt, /agent:assigned`, `agent:execute`, `agent:triage/);
-      assert.match(triagePrompt, /A human decides when the agent plans or implements/);
+      assert.match(triagePrompt, /agent:sdd/);
+      assert.match(triagePrompt, /agent:execute/);
+      assert.match(triagePrompt, /agent:triage/);
+      assert.match(triagePrompt, /never touch control labels/);
     });
 
     test('cross-link by mention rather than by commenting on other issues', () => {
@@ -419,17 +425,11 @@ describe('prompt rendering', () => {
       assert.match(triagePrompt, /search_issues/);
     });
 
-    test('ask for a difficulty and an estimate', () => {
-      assert.match(triagePrompt, /\*\*Difficulty:\*\* moderate · \*\*Estimate:\*\* 4-8h/);
-      for (const level of ['trivial', 'small', 'moderate', 'large', 'unknown']) {
-        assert.match(triagePrompt, new RegExp(`- \`${level}\` —`));
-      }
-      assert.match(triagePrompt, /review and QA excluded/);
-    });
-
-    test('cap the comment instead of inviting a report', () => {
-      assert.match(triagePrompt, /under 120 words/);
-      assert.match(triagePrompt, /no summary of what you read/);
+    test('ask for an estimate plus related issues and files', () => {
+      assert.match(triagePrompt, /\*\*Estimate:\*\* 4-8h/);
+      assert.match(triagePrompt, /\*\*Related:\*\* #12, #34/);
+      assert.match(triagePrompt, /\*\*Files:\*\*/);
+      assert.match(triagePrompt, /rough implementation time/);
     });
 
     test('keep labels on the triaged issue only', () => {
@@ -441,39 +441,16 @@ describe('prompt rendering', () => {
       assert.doesNotMatch(triagePrompt, /null#/);
     });
 
-    test('treat the issue as a report rather than as instructions', () => {
-      assert.match(triagePrompt, /report, not an instruction/);
-    });
-
-    test('ask for the missing detail through the repo templates instead of guessing', () => {
-      assert.match(triagePrompt, /too thin to size or classify/);
-      assert.match(triagePrompt, /\.github\/ISSUE_TEMPLATE\//);
-      assert.match(triagePrompt, /If you can size it, ask for nothing/);
-    });
-
-    // The fixture issue was opened 2026-09-16.
-    const agedBy = (now) =>
-      buildPrompt({
+    test('a days-old issue still carries opened age in the header', () => {
+      const fresh = buildPrompt({
         context: issueContext,
         branch: 'main',
         prNumber: null,
         action: 'agent:triage',
         taskId: 't-triage',
-        now: Date.parse(now),
+        now: Date.parse('2026-09-18T18:04:11Z'),
       });
-
-    test('a days-old issue is dated but not called stale', () => {
-      const fresh = agedBy('2026-09-18T18:04:11Z');
       assert.match(fresh, /Opened: 2026-09-16T18:04:11Z \(2 days ago\)/);
-      assert.doesNotMatch(fresh, /may show the fix already landed/);
-      assert.match(fresh, /Recommend closing; never close it yourself/);
-    });
-
-    test('a weeks-old issue is flagged as possibly already resolved', () => {
-      const stale = agedBy('2026-10-16T18:04:11Z');
-      assert.match(stale, /this issue was opened 30 days ago, old enough/);
-      assert.match(stale, /git log --since=2026-09-16 -- <path>/);
-      assert.match(stale, /Recommend closing; never close it yourself/);
     });
   });
 
@@ -491,9 +468,9 @@ describe('prompt rendering', () => {
     // to push to a branch it has no branch for and stated the triage rules twice.
     test('a prompt carries the rules for its own mode only', () => {
       const otherModes = {
-        'agent:triage': [/Ground rules \(plan\)/, /Ground rules \(execute\)/, /push to `origin/],
-        'agent:assigned': [/Ground rules \(triage\)/, /Ground rules \(execute\)/, /push to `origin/],
-        'agent:execute': [/Ground rules \(triage\)/, /Ground rules \(plan\)/, /\*\*Difficulty:\*\*/],
+        'agent:triage': [/Ground rules \(system design\)/, /Ground rules \(execute\)/, /push to `origin/],
+        'agent:sdd': [/Ground rules \(triage\)/, /Ground rules \(execute\)/, /push to `origin/],
+        'agent:execute': [/Ground rules \(triage\)/, /Ground rules \(system design\)/, /## Triage\n/],
       };
 
       for (const [action, forbidden] of Object.entries(otherModes)) {
@@ -505,17 +482,17 @@ describe('prompt rendering', () => {
     });
 
     test('the inlined protocol stays mode-independent', () => {
-      for (const action of ['agent:triage', 'agent:assigned', 'agent:execute']) {
+      for (const action of ['agent:triage', 'agent:sdd', 'agent:execute']) {
         const protocol = forMode(action).split('## The issue')[0];
         assert.match(protocol, /Shared context gathering/);
         assert.doesNotMatch(protocol, /^## (Triage|Plan|Execute) mode/m);
       }
     });
 
-    test('each mode still states a deliverable and a definition of done', () => {
+    test('each mode still states its deliverable', () => {
       for (const [action, done] of [
-        ['agent:triage', /Definition of done \(triage\)/],
-        ['agent:assigned', /Definition of done \(plan\)/],
+        ['agent:triage', /## Triage/],
+        ['agent:sdd', /Definition of done \(system design\)/],
         ['agent:execute', /Definition of done \(execute\)/],
       ]) {
         assert.match(forMode(action), done);
@@ -868,6 +845,37 @@ describe('result.json validation', () => {
     assert.equal(result.valid, true);
     assert.equal(result.exitCode, 0);
     assert.equal(result.chatId, 'chat-abc');
+    assert.equal(result.tokenUsage, null);
+  });
+
+  test('token_usage is accepted when all four fields are non-negative integers', () => {
+    const paths = dirFor(11);
+    const usage = {
+      inputTokens: 3,
+      outputTokens: 6,
+      cacheReadTokens: 12635,
+      cacheWriteTokens: 3136,
+    };
+    writeFileSync(
+      paths.resultJson,
+      JSON.stringify({ exit_code: 0, finished_at: '2026-09-18T00:00:00Z', token_usage: usage })
+    );
+    assert.deepEqual(readResult(paths).tokenUsage, usage);
+  });
+
+  test('garbage token_usage is discarded rather than stored', () => {
+    const paths = dirFor(12);
+    writeFileSync(
+      paths.resultJson,
+      JSON.stringify({
+        exit_code: 0,
+        token_usage: { inputTokens: -1, outputTokens: 1, cacheReadTokens: 1, cacheWriteTokens: 1 },
+      })
+    );
+    assert.equal(readResult(paths).tokenUsage, null);
+
+    writeFileSync(paths.resultJson, JSON.stringify({ exit_code: 0, token_usage: 'nope' }));
+    assert.equal(readResult(paths).tokenUsage, null);
   });
 
   test('a missing file reads as absent, never as success', () => {

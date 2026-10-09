@@ -15,11 +15,16 @@ export const PROJECT = {
   repo: 'my-org/primary-app',
   repo_key: 'my-org/primary-app',
   default_branch: 'main',
-  trigger_label: 'agent:assigned',
+  trigger_label: 'agent:sdd',
   execute_label: 'agent:execute',
   triage_label: 'agent:triage',
+  research_label: 'agent:research',
+  graphic_label: 'agent:graphic',
+  monitor_label: 'agent:monitor',
+  test_label: 'agent:test',
   mention: '@dev-agent',
   agent_login: 'dev-agent',
+  plan_folder: '.agent/plans',
   webhook_secret_env: null,
 };
 

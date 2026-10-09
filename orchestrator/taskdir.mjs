@@ -129,6 +129,20 @@ export function sanitizeText(text, maxChars = MAX_ERROR_CHARS) {
     .slice(0, maxChars);
 }
 
+const TOKEN_USAGE_KEYS = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'];
+
+/** Accept only the four non-negative integer fields the queue stores; anything else is null. */
+export function sanitizeTokenUsage(value) {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) return null;
+  const out = {};
+  for (const key of TOKEN_USAGE_KEYS) {
+    const n = value[key];
+    if (!Number.isInteger(n) || n < 0) return null;
+    out[key] = n;
+  }
+  return out;
+}
+
 /**
  * Read the runner's self-reported outcome.
  *
@@ -141,7 +155,7 @@ export function readResult(paths) {
   try {
     raw = readFileSync(paths.resultJson);
   } catch {
-    return { present: false, exitCode: null, reason: null };
+    return { present: false, exitCode: null, reason: null, tokenUsage: null };
   }
 
   if (raw.length > MAX_RESULT_BYTES) {
@@ -150,6 +164,7 @@ export function readResult(paths) {
       valid: false,
       exitCode: null,
       reason: `result.json is ${raw.length} bytes, over the ${MAX_RESULT_BYTES} limit`,
+      tokenUsage: null,
     };
   }
 
@@ -157,11 +172,23 @@ export function readResult(paths) {
   try {
     parsed = JSON.parse(raw.toString('utf8'));
   } catch {
-    return { present: true, valid: false, exitCode: null, reason: 'result.json is not valid JSON' };
+    return {
+      present: true,
+      valid: false,
+      exitCode: null,
+      reason: 'result.json is not valid JSON',
+      tokenUsage: null,
+    };
   }
 
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return { present: true, valid: false, exitCode: null, reason: 'result.json is not an object' };
+    return {
+      present: true,
+      valid: false,
+      exitCode: null,
+      reason: 'result.json is not an object',
+      tokenUsage: null,
+    };
   }
 
   const exitCode = Number.isInteger(parsed.exit_code) ? parsed.exit_code : null;
@@ -171,6 +198,7 @@ export function readResult(paths) {
       valid: false,
       exitCode: null,
       reason: 'result.json has no integer exit_code',
+      tokenUsage: null,
     };
   }
 
@@ -184,6 +212,7 @@ export function readResult(paths) {
     valid: true,
     exitCode,
     chatId,
+    tokenUsage: sanitizeTokenUsage(parsed.token_usage),
     reason: parsed.reason ? sanitizeText(parsed.reason, 500) : null,
     finishedAt: typeof parsed.finished_at === 'string' ? sanitizeText(parsed.finished_at, 64) : null,
   };

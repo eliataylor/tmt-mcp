@@ -20,7 +20,7 @@ import {
   resolveBranchPlan,
   resolvePlanRelativePath,
 } from '../orchestrator/repo.mjs';
-import { isPlanAction } from '../orchestrator/plan.mjs';
+import { isArtifactAction } from '../orchestrator/plan.mjs';
 import { buildCreateBranchBody, branchNameFor as neonBranchNameFor } from '../orchestrator/neon.mjs';
 import { githubMcpEnv } from '../orchestrator/mcp.mjs';
 import { buildPrompt } from '../orchestrator/prompt.mjs';
@@ -124,7 +124,7 @@ console.log(`thread        : ${context.fetch.comment_count} comment(s), ${contex
 
 // Triage reads the tree and writes labels, so every code-bearing stage below is skipped for it.
 const triage = verdict.action === ACTIONS.TRIAGE;
-const planning = isPlanAction(verdict.action);
+const planning = isArtifactAction(verdict.action);
 const planPath = triage ? null : resolvePlanRelativePath(project, issueNumber);
 
 heading('3. Git isolation');

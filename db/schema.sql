@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     github_issue_id     INTEGER NOT NULL,         -- GitHub internal id
     github_issue_number INTEGER NOT NULL,         -- the #42 humans use
     issue_title         TEXT NOT NULL,
-    action              TEXT NOT NULL,            -- 'agent:assigned', 'comment_created', ...
+    action              TEXT NOT NULL,            -- 'agent:sdd', 'agent:execute', 'comment_created', ...
     payload             BLOB NOT NULL,            -- raw delivery, jsonb
     context             BLOB NOT NULL,            -- normalized manifest, jsonb
     status              TEXT NOT NULL DEFAULT 'pending'
@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     locked_at           TEXT,
     lease_expires_at    TEXT,
     last_error          TEXT,
+    token_usage         TEXT,                     -- latest attempt's CLI usage JSON; overwritten each attempt
     completed_at        TEXT,
     created_at          TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at          TEXT NOT NULL DEFAULT (datetime('now'))

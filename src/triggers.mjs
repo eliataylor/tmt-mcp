@@ -6,19 +6,29 @@
  *   { kind: 'cancel', reason }   - drop this issue's pending tasks
  *   { kind: 'ignore', reason }   - acknowledge with 200 so GitHub does not retry
  *
- * Plan vs execute vs triage:
- *   trigger_label (default agent:assigned) — plan/questions committed to the plan file on the task
- *     branch, linked from a short issue comment; no code.
- *   execute_label (default agent:execute) — implement on the task branch.
- *   triage_label (default agent:triage) — label the issue and cross-link related ones; no code.
+ * Stage labels (defaults):
+ *   agent:triage — labels + sizing comment; no branch
+ *   agent:research / agent:graphic / agent:sdd / agent:monitor — stage markdown under .agent/plans/{n}/
+ *   agent:execute — implement from PLAN.md; write TEST.md Instructions
+ *   agent:test — run TEST.md Instructions; write Results
+ *
+ * trigger_label (default agent:sdd) is the cancel label and the System Design wake.
  */
 
 export const ACTIONS = {
-  ASSIGNED: 'agent:assigned',
+  SDD: 'agent:sdd',
+  /** @deprecated Use ACTIONS.SDD. Kept as an alias for older imports. */
+  ASSIGNED: 'agent:sdd',
   OPENED: 'agent:opened',
   EXECUTE: 'agent:execute',
   TRIAGE: 'agent:triage',
+  RESEARCH: 'agent:research',
+  GRAPHIC: 'agent:graphic',
+  MONITOR: 'agent:monitor',
+  TEST: 'agent:test',
   COMMENT: 'comment_created',
+  /** Sticky usage reply when a mention has no Action token and no control labels. */
+  MENTION_HELP: 'mention_help',
 };
 
 function labelNames(payload) {
@@ -29,16 +39,16 @@ function hasLabel(payload, name) {
   return name ? labelNames(payload).some((l) => l === name) : false;
 }
 
-function hasTriggerLabel(payload, project) {
-  return hasLabel(payload, project.trigger_label);
-}
-
-function hasExecuteLabel(payload, project) {
-  return hasLabel(payload, project.execute_label);
-}
-
-function hasTriageLabel(payload, project) {
-  return hasLabel(payload, project.triage_label);
+function projectLabels(project) {
+  return {
+    trigger: project.trigger_label || 'agent:sdd',
+    execute: project.execute_label || 'agent:execute',
+    triage: project.triage_label || 'agent:triage',
+    research: project.research_label || 'agent:research',
+    graphic: project.graphic_label || 'agent:graphic',
+    monitor: project.monitor_label || 'agent:monitor',
+    test: project.test_label || 'agent:test',
+  };
 }
 
 function ignore(reason) {
@@ -77,24 +87,12 @@ function isTrustedActor(event, payload) {
 
 /**
  * The agent's own comments and label changes must never re-trigger it.
- *
- * Every plan run ends in an issue comment linking the new plan revision, and the issue still carries
- * its trigger label when that comment lands — so without this the agent answers itself until a
- * human removes the label.
- * Triage mode's deliverable is a set of labels, which arrive back as `issues.labeled` deliveries.
- * A GitHub App is recognised by type; a machine user needs `agent_login` to match the token the
- * orchestrator posts with. Leave `agent_login` unset only when the agent posts as a Bot.
  */
 function isAgentAuthor(user, project) {
   if (!user) return false;
   if (user.type === 'Bot') return true;
   const login = project.agent_login;
   return Boolean(login) && String(user.login || '').toLowerCase() === String(login).toLowerCase();
-}
-
-/** @-mentions and issue bodies that call the agent in without a control label yet. */
-function mentionAction(payload, project) {
-  return hasExecuteLabel(payload, project) ? ACTIONS.EXECUTE : ACTIONS.ASSIGNED;
 }
 
 function escapeRegex(text) {
@@ -115,19 +113,91 @@ function issueBodyHasMention(payload, project) {
   return textHasMention(payload?.issue?.body || '', project);
 }
 
+/**
+ * Priority: execute → test → sdd → research / graphic / monitor → triage.
+ * Returns the enqueue action, or null when nothing matches.
+ */
+export function actionFromLabels(payload, project, { forComment = false } = {}) {
+  const L = projectLabels(project);
+
+  if (hasLabel(payload, L.execute)) return ACTIONS.EXECUTE;
+  if (hasLabel(payload, L.test)) return ACTIONS.TEST;
+  if (hasLabel(payload, L.trigger)) {
+    return forComment ? ACTIONS.COMMENT : ACTIONS.SDD;
+  }
+  if (hasLabel(payload, L.research)) return ACTIONS.RESEARCH;
+  if (hasLabel(payload, L.graphic)) return ACTIONS.GRAPHIC;
+  if (hasLabel(payload, L.monitor)) return ACTIONS.MONITOR;
+  if (hasLabel(payload, L.triage)) return forComment ? null : ACTIONS.TRIAGE;
+  return null;
+}
+
+/** Label name → wake action (trigger maps to SDD, never comment_created / opened). */
+function labeledAction(name, project) {
+  const L = projectLabels(project);
+  if (name === L.execute) return ACTIONS.EXECUTE;
+  if (name === L.test) return ACTIONS.TEST;
+  if (name === L.trigger) return ACTIONS.SDD;
+  if (name === L.research) return ACTIONS.RESEARCH;
+  if (name === L.graphic) return ACTIONS.GRAPHIC;
+  if (name === L.monitor) return ACTIONS.MONITOR;
+  if (name === L.triage) return ACTIONS.TRIAGE;
+  return null;
+}
+
+/**
+ * Control-label names in priority order for matching tokens in mention text.
+ */
+function controlLabelsInPriority(project) {
+  const L = projectLabels(project);
+  return [L.execute, L.test, L.trigger, L.research, L.graphic, L.monitor, L.triage].filter(Boolean);
+}
+
+/**
+ * First configured control-label string that appears as a bare token in text.
+ * Priority: execute → test → sdd → research → graphic → monitor → triage.
+ */
+export function controlLabelTokenInText(text, project) {
+  const haystack = String(text || '');
+  if (!haystack) return null;
+  for (const name of controlLabelsInPriority(project)) {
+    const re = new RegExp(`(?:^|[^A-Za-z0-9_-])${escapeRegex(name)}(?![A-Za-z0-9_-])`);
+    if (re.test(haystack)) return name;
+  }
+  return null;
+}
+
+/**
+ * Mention wakes: text token → issue control labels → mention_help.
+ * Never silently defaults to SDD.
+ */
+export function resolveMentionAction({ text, payload, project }) {
+  const token = controlLabelTokenInText(text, project);
+  if (token) {
+    const mapped = labeledAction(token, project);
+    if (mapped) return mapped;
+  }
+  const fromLabels = actionFromLabels(payload, project, { forComment: false });
+  if (fromLabels) return fromLabels;
+  return ACTIONS.MENTION_HELP;
+}
+
+/** Configured control-label names for help copy (deduped, stable order). */
+export function configuredControlLabels(project) {
+  return [...new Set(controlLabelsInPriority(project))];
+}
+
 export function classify({ event, payload, project }) {
   if (!project) return ignore('unregistered repository');
   if (event === 'ping') return ignore('ping');
   if (!payload?.issue) return ignore(`unsupported event "${event}"`);
 
   const action = payload.action;
+  const L = projectLabels(project);
 
   if (event === 'issues') {
     switch (action) {
       case 'labeled': {
-        // A triage run applies labels, so its own deliveries come straight back here. Escalation
-        // has to stay a human decision: without this, one triage label could label its way into
-        // execute mode.
         if (isAgentAuthor(payload.sender, project)) {
           return ignore('label was applied by the agent');
         }
@@ -135,16 +205,9 @@ export function classify({ event, payload, project }) {
         if (!isTrustedActor(event, payload)) {
           return ignore('actor is not a write collaborator');
         }
-        if (name === project.execute_label) {
-          return { kind: 'enqueue', action: ACTIONS.EXECUTE };
-        }
-        if (name === project.trigger_label) {
-          return { kind: 'enqueue', action: ACTIONS.ASSIGNED };
-        }
-        if (name === project.triage_label) {
-          return { kind: 'enqueue', action: ACTIONS.TRIAGE };
-        }
-        return ignore(`label "${name}" is not a trigger, execute or triage label`);
+        const mapped = labeledAction(name, project);
+        if (mapped) return { kind: 'enqueue', action: mapped };
+        return ignore(`label "${name}" is not a stage, execute, test or triage label`);
       }
 
       case 'assigned':
@@ -154,34 +217,53 @@ export function classify({ event, payload, project }) {
         if (!isTrustedActor(event, payload)) {
           return ignore('actor is not a write collaborator');
         }
-        return { kind: 'enqueue', action: ACTIONS.ASSIGNED };
+        return { kind: 'enqueue', action: ACTIONS.SDD };
 
       case 'opened':
-      case 'reopened':
+      case 'reopened': {
         if (!isTrustedActor(event, payload)) {
           return ignore('actor is not a write collaborator');
         }
-        if (hasExecuteLabel(payload, project)) {
+        // Mentions use text token → issue labels → help (trigger label → SDD, not opened).
+        if (issueBodyHasMention(payload, project)) {
+          return {
+            kind: 'enqueue',
+            action: resolveMentionAction({
+              text: payload.issue?.body || '',
+              payload,
+              project,
+            }),
+          };
+        }
+        if (hasLabel(payload, L.execute)) {
           return { kind: 'enqueue', action: ACTIONS.EXECUTE };
         }
-        if (hasTriggerLabel(payload, project)) {
+        if (hasLabel(payload, L.test)) {
+          return { kind: 'enqueue', action: ACTIONS.TEST };
+        }
+        if (hasLabel(payload, L.trigger)) {
           return { kind: 'enqueue', action: ACTIONS.OPENED };
         }
-        // Last, because an issue opened with both wants the plan; triage is what you reach for when
-        // nobody has decided the issue is worth planning yet.
-        if (hasTriageLabel(payload, project)) {
+        if (hasLabel(payload, L.research)) {
+          return { kind: 'enqueue', action: ACTIONS.RESEARCH };
+        }
+        if (hasLabel(payload, L.graphic)) {
+          return { kind: 'enqueue', action: ACTIONS.GRAPHIC };
+        }
+        if (hasLabel(payload, L.monitor)) {
+          return { kind: 'enqueue', action: ACTIONS.MONITOR };
+        }
+        if (hasLabel(payload, L.triage)) {
           return { kind: 'enqueue', action: ACTIONS.TRIAGE };
         }
-        if (issueBodyHasMention(payload, project)) {
-          return { kind: 'enqueue', action: mentionAction(payload, project) };
-        }
-        return ignore('issue does not carry a trigger, execute or triage label and body has no mention');
+        return ignore('issue does not carry a stage, execute, test or triage label and body has no mention');
+      }
 
       case 'closed':
         return { kind: 'cancel', reason: 'issue closed' };
 
       case 'unlabeled':
-        if (payload.label?.name === project.trigger_label) {
+        if (payload.label?.name === L.trigger) {
           return { kind: 'cancel', reason: 'trigger label removed' };
         }
         return ignore(`label "${payload.label?.name}" is not the trigger label`);
@@ -201,17 +283,15 @@ export function classify({ event, payload, project }) {
     }
     const body = payload.comment?.body || '';
     if (textHasMention(body, project)) {
-      return { kind: 'enqueue', action: mentionAction(payload, project) };
+      return {
+        kind: 'enqueue',
+        action: resolveMentionAction({ text: body, payload, project }),
+      };
     }
-    if (hasExecuteLabel(payload, project)) {
-      return { kind: 'enqueue', action: ACTIONS.EXECUTE };
-    }
-    if (hasTriggerLabel(payload, project)) {
-      return { kind: 'enqueue', action: ACTIONS.COMMENT };
-    }
-    // The triage label is deliberately not listed: triage is a one-shot classification, so a
-    // triaged issue should go quiet again rather than re-triaging on every later comment.
-    return ignore('comment has no agent mention and the issue lacks trigger or execute labels');
+    const fromLabels = actionFromLabels(payload, project, { forComment: true });
+    if (fromLabels) return { kind: 'enqueue', action: fromLabels };
+    // Triage is one-shot: later comments do not re-triage.
+    return ignore('comment has no agent mention and the issue lacks a revisable stage or execute/test label');
   }
 
   return ignore(`unsupported event "${event}"`);

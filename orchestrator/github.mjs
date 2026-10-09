@@ -106,6 +106,37 @@ export function createGithubClient({ token, fetchImpl = fetch, logger = console 
       return must(res, 'Commenting on issue');
     },
 
+    async listIssueComments({ owner, repo, issueNumber, perPage = 100 }) {
+      const res = await api(
+        'GET',
+        `/repos/${owner}/${repo}/issues/${issueNumber}/comments?per_page=${perPage}`
+      );
+      const list = must(res, 'Listing issue comments');
+      return Array.isArray(list) ? list : [];
+    },
+
+    async updateIssueComment({ owner, repo, commentId, body }) {
+      const res = await api('PATCH', `/repos/${owner}/${repo}/issues/comments/${commentId}`, {
+        body,
+      });
+      return must(res, 'Updating issue comment');
+    },
+
+    /**
+     * Create or edit a sticky card identified by a marker substring in the comment body
+     * (e.g. `<!-- tmt:card:PLAN -->`).
+     */
+    async upsertIssueComment({ owner, repo, issueNumber, marker, body }) {
+      const comments = await this.listIssueComments({ owner, repo, issueNumber });
+      const existing = comments.find((c) => typeof c.body === 'string' && c.body.includes(marker));
+      if (existing) {
+        logger.log(`[GitHub] updating sticky comment ${existing.id} on #${issueNumber}`);
+        return this.updateIssueComment({ owner, repo, commentId: existing.id, body });
+      }
+      logger.log(`[GitHub] creating sticky comment on #${issueNumber}`);
+      return this.commentOnIssue({ owner, repo, issueNumber, body });
+    },
+
     async getRepo({ owner, repo }) {
       return must(await api('GET', `/repos/${owner}/${repo}`), 'Reading repository');
     },

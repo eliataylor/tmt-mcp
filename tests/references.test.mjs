@@ -161,7 +161,7 @@ describe('source attribution across a whole delivery', () => {
   test('an issues delivery has no trigger comment', () => {
     const context = buildContext({
       event: 'issues',
-      action: 'agent:assigned',
+      action: 'agent:sdd',
       payload: fixture('issues.labeled.json'),
       project: PROJECT,
     });

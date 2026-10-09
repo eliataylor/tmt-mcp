@@ -15,7 +15,7 @@
     "user": { "login": "eliataylor", "id": 4410021, "type": "User" },
     "labels": [
       { "id": 8812001, "name": "bug", "color": "d73a4a" },
-      { "id": 8812002, "name": "agent:assigned", "color": "0e8a16" }
+      { "id": 8812002, "name": "agent:sdd", "color": "0e8a16" }
     ],
     "assignees": [{ "login": "dev-agent", "id": 99120034, "type": "Bot" }],
     "author_association": "OWNER",

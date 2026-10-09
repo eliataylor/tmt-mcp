@@ -39,12 +39,28 @@ describe('issues events', () => {
     });
   });
 
+  test('stage labels enqueue their modes', () => {
+    for (const [name, action] of [
+      ['agent:research', ACTIONS.RESEARCH],
+      ['agent:graphic', ACTIONS.GRAPHIC],
+      ['agent:monitor', ACTIONS.MONITOR],
+      ['agent:test', ACTIONS.TEST],
+    ]) {
+      const payload = labeled();
+      payload.label = { name };
+      assert.deepEqual(classify({ event: 'issues', payload, project: PROJECT }), {
+        kind: 'enqueue',
+        action,
+      });
+    }
+  });
+
   test('a label the agent applied itself never enqueues', () => {
     for (const sender of [
       { login: 'Dev-Agent', type: 'User' },
       { login: 'some-app[bot]', type: 'Bot' },
     ]) {
-      for (const name of ['agent:triage', 'agent:assigned', 'agent:execute']) {
+      for (const name of ['agent:triage', 'agent:sdd', 'agent:execute']) {
         const payload = labeled();
         payload.label = { name };
         payload.sender = sender;
@@ -82,12 +98,12 @@ describe('issues events', () => {
     assert.equal(classify({ event: 'issues', payload: withoutLabel, project: PROJECT }).kind, 'ignore');
   });
 
-  test('opened with an agent mention in the body enqueues plan mode without labels', () => {
+  test('opened with a bare agent mention and no control labels gets mention help', () => {
     const payload = labeled();
     payload.action = 'opened';
     payload.issue.labels = [{ name: 'bug' }];
     payload.issue.body = 'Please look at this @dev-agent';
-    assert.equal(classify({ event: 'issues', payload, project: PROJECT }).action, ACTIONS.ASSIGNED);
+    assert.equal(classify({ event: 'issues', payload, project: PROJECT }).action, ACTIONS.MENTION_HELP);
   });
 
   test('opened mention with execute label on the issue runs execute mode', () => {
@@ -98,7 +114,23 @@ describe('issues events', () => {
     assert.equal(classify({ event: 'issues', payload, project: PROJECT }).action, ACTIONS.EXECUTE);
   });
 
-  test('control labels on open beat a body mention', () => {
+  test('opened mention with sdd label on the issue runs SDD (not opened)', () => {
+    const payload = labeled();
+    payload.action = 'opened';
+    payload.issue.labels = [{ name: 'agent:sdd' }];
+    payload.issue.body = '@dev-agent please look';
+    assert.equal(classify({ event: 'issues', payload, project: PROJECT }).action, ACTIONS.SDD);
+  });
+
+  test('opened mention text token beats a conflicting issue label', () => {
+    const payload = labeled();
+    payload.action = 'opened';
+    payload.issue.labels = [{ name: 'agent:sdd' }];
+    payload.issue.body = '@dev-agent agent:test re-check Instructions';
+    assert.equal(classify({ event: 'issues', payload, project: PROJECT }).action, ACTIONS.TEST);
+  });
+
+  test('issue control labels resolve a body mention when there is no text token', () => {
     const payload = labeled();
     payload.action = 'opened';
     payload.issue.labels = [{ name: 'agent:triage' }];
@@ -116,7 +148,7 @@ describe('issues events', () => {
   test('an issue opened with both triage and trigger labels gets the plan', () => {
     const payload = labeled();
     payload.action = 'opened';
-    payload.issue.labels = [{ name: 'agent:triage' }, { name: 'agent:assigned' }];
+    payload.issue.labels = [{ name: 'agent:triage' }, { name: 'agent:sdd' }];
     assert.equal(classify({ event: 'issues', payload, project: PROJECT }).action, ACTIONS.OPENED);
   });
 
@@ -145,26 +177,51 @@ describe('issues events', () => {
 });
 
 describe('issue_comment events', () => {
-  test('a mention enqueues', () => {
+  test('a mention with sdd on the issue enqueues SDD', () => {
+    // Fixture has agent:sdd on the issue and no Action token in the comment.
     assert.deepEqual(classify({ event: 'issue_comment', payload: commented(), project: PROJECT }), {
       kind: 'enqueue',
-      action: ACTIONS.ASSIGNED,
+      action: ACTIONS.SDD,
     });
   });
 
-  test('a mention enqueues without any issue labels', () => {
+  test('a bare mention without labels gets mention help', () => {
     const payload = commented();
     payload.issue.labels = [];
     payload.comment.body = '@dev-agent please plan this';
-    assert.equal(classify({ event: 'issue_comment', payload, project: PROJECT }).action, ACTIONS.ASSIGNED);
+    assert.equal(
+      classify({ event: 'issue_comment', payload, project: PROJECT }).action,
+      ACTIONS.MENTION_HELP
+    );
+  });
+
+  test('a mention text token selects the Action', () => {
+    const payload = commented();
+    payload.issue.labels = [{ name: 'bug' }];
+    payload.comment.body = '@dev-agent agent:research dig into conversion';
+    assert.equal(classify({ event: 'issue_comment', payload, project: PROJECT }).action, ACTIONS.RESEARCH);
+  });
+
+  test('a mention text token beats a conflicting issue label', () => {
+    const payload = commented();
+    payload.issue.labels = [{ name: 'agent:sdd' }];
+    payload.comment.body = '@dev-agent agent:execute ship the plan';
+    assert.equal(classify({ event: 'issue_comment', payload, project: PROJECT }).action, ACTIONS.EXECUTE);
+  });
+
+  test('a mention falls back to issue control labels when there is no text token', () => {
+    const payload = commented();
+    payload.issue.labels = [{ name: 'agent:graphic' }];
+    payload.comment.body = '@dev-agent please continue';
+    assert.equal(classify({ event: 'issue_comment', payload, project: PROJECT }).action, ACTIONS.GRAPHIC);
   });
 
   test('a mention matches agent_login when mention string differs', () => {
     const payload = commented();
     payload.issue.labels = [];
-    payload.comment.body = '@dev-agent ping';
+    payload.comment.body = '@dev-agent agent:sdd ping';
     const project = { ...PROJECT, mention: '@tmt-agent' };
-    assert.equal(classify({ event: 'issue_comment', payload, project }).action, ACTIONS.ASSIGNED);
+    assert.equal(classify({ event: 'issue_comment', payload, project }).action, ACTIONS.SDD);
   });
 
   test('a comment on an already-labeled issue enqueues without a mention', () => {
@@ -175,7 +232,7 @@ describe('issue_comment events', () => {
 
   test('a comment on an issue with execute label runs in execute mode', () => {
     const payload = commented();
-    payload.issue.labels = [{ name: 'agent:assigned' }, { name: 'agent:execute' }];
+    payload.issue.labels = [{ name: 'agent:sdd' }, { name: 'agent:execute' }];
     payload.comment.body = 'go ahead with the plan';
     assert.equal(classify({ event: 'issue_comment', payload, project: PROJECT }).action, ACTIONS.EXECUTE);
   });
@@ -207,7 +264,8 @@ describe('issue_comment events', () => {
   test('without an agent_login, mentions still enqueue via the configured mention string', () => {
     const payload = commented();
     const project = { ...PROJECT, agent_login: null };
-    assert.equal(classify({ event: 'issue_comment', payload, project }).action, ACTIONS.ASSIGNED);
+    // Fixture comment has no Action token; issue still has agent:sdd.
+    assert.equal(classify({ event: 'issue_comment', payload, project }).action, ACTIONS.SDD);
   });
 
   test('edits and deletions are ignored', () => {

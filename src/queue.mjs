@@ -12,9 +12,38 @@ export const QUEUE_DEFAULTS = {
 const RETURNING_COLUMNS = `
   id, delivery_id, project_slug, repo_full_name, github_issue_id, github_issue_number,
   issue_title, action, status, attempts, max_attempts, available_at,
-  locked_by, locked_at, lease_expires_at, last_error, completed_at, created_at, updated_at,
+  locked_by, locked_at, lease_expires_at, last_error, token_usage, completed_at, created_at, updated_at,
   json(payload) AS payload, json(context) AS context
 `;
+
+const TOKEN_USAGE_KEYS = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'];
+
+/**
+ * Normalize CLI usage into a small JSON string for storage, or null when missing/invalid.
+ * Always overwrite on complete/fail — retries replace the previous attempt's value.
+ */
+export function serializeTokenUsage(tokenUsage) {
+  if (tokenUsage == null) return null;
+  if (typeof tokenUsage !== 'object' || Array.isArray(tokenUsage)) return null;
+  const out = {};
+  for (const key of TOKEN_USAGE_KEYS) {
+    const n = tokenUsage[key];
+    if (!Number.isInteger(n) || n < 0) return null;
+    out[key] = n;
+  }
+  return JSON.stringify(out);
+}
+
+function parseTokenUsage(raw) {
+  if (raw == null || raw === '') return null;
+  try {
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    const serialized = serializeTokenUsage(parsed);
+    return serialized ? JSON.parse(serialized) : null;
+  } catch {
+    return null;
+  }
+}
 
 /** payload and context come back as JSON text from json(); give callers real objects. */
 function hydrate(row) {
@@ -23,6 +52,7 @@ function hydrate(row) {
     ...row,
     payload: row.payload ? JSON.parse(row.payload) : null,
     context: row.context ? JSON.parse(row.context) : null,
+    token_usage: parseTokenUsage(row.token_usage),
   };
 }
 
@@ -130,7 +160,7 @@ export function claim(db, { worker = 'orchestrator', projectSlugs = [], leaseSec
   return hydrate(run.immediate(params));
 }
 
-export function complete(db, id) {
+export function complete(db, id, { tokenUsage } = {}) {
   return hydrate(
     db
       .prepare(
@@ -138,12 +168,13 @@ export function complete(db, id) {
             SET status = 'completed',
                 locked_by = NULL, locked_at = NULL, lease_expires_at = NULL,
                 last_error = NULL,
+                token_usage = @token_usage,
                 completed_at = datetime('now'),
                 updated_at = datetime('now')
           WHERE id = @id AND status = 'processing'
          RETURNING ${RETURNING_COLUMNS}`
       )
-      .get({ id })
+      .get({ id, token_usage: serializeTokenUsage(tokenUsage) })
   );
 }
 
@@ -151,7 +182,7 @@ export function complete(db, id) {
  * Report a failure. Re-queues with exponential backoff until max_attempts is spent,
  * then parks the task as failed.
  */
-export function fail(db, id, error = null, { backoffSeconds } = {}) {
+export function fail(db, id, error = null, { backoffSeconds, tokenUsage } = {}) {
   const base = backoffSeconds ?? QUEUE_DEFAULTS.backoffSeconds;
   return hydrate(
     db
@@ -160,6 +191,7 @@ export function fail(db, id, error = null, { backoffSeconds } = {}) {
             SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
                 locked_by = NULL, locked_at = NULL, lease_expires_at = NULL,
                 last_error = @error,
+                token_usage = @token_usage,
                 available_at = CASE
                   WHEN attempts >= max_attempts THEN available_at
                   ELSE datetime('now', '+' || (@base * (1 << (attempts - 1))) || ' seconds')
@@ -169,7 +201,7 @@ export function fail(db, id, error = null, { backoffSeconds } = {}) {
           WHERE id = @id AND status = 'processing'
          RETURNING ${RETURNING_COLUMNS}`
       )
-      .get({ id, error, base })
+      .get({ id, error, base, token_usage: serializeTokenUsage(tokenUsage) })
   );
 }
 
@@ -261,12 +293,13 @@ export function listTasks(db, { status = null, projectSlug = null, limit = 50 } 
     .prepare(
       `SELECT id, delivery_id, project_slug, repo_full_name, github_issue_id, github_issue_number,
               issue_title, action, status, attempts, max_attempts, available_at,
-              locked_by, lease_expires_at, last_error, completed_at, created_at, updated_at
+              locked_by, lease_expires_at, last_error, token_usage, completed_at, created_at, updated_at
          FROM agent_tasks ${where}
         ORDER BY created_at DESC, rowid DESC
         LIMIT @limit`
     )
-    .all(params);
+    .all(params)
+    .map((row) => ({ ...row, token_usage: parseTokenUsage(row.token_usage) }));
 }
 
 export function statusCounts(db) {

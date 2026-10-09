@@ -1,18 +1,19 @@
-# Plan: #{issue} {issue_title}
+# System design: #{issue} {issue_title}
 
 <!-- summary: -->
 
 - Issue: {issue_url}
 - Scaffolded: {created_at} by task `{task_id}`
 
-Each plan run edits this file and is committed as its own revision, so `git log -- <this file>`
-shows how the plan evolved. The issue thread links to every revision.
+Each System Design run edits this file and is committed as its own revision, so
+`git log -- <this file>` shows how the design evolved. The issue sticky card
+links to every revision.
 
 ## Understanding
 
 _What the issue is asking for, in plain language._
 
-## Open questions
+## Needs from you
 
 _Numbered. Anything that blocks a confident implementation: behavior, scope, a design choice,
 access the agent does not have. Write "None" when nothing blocks._

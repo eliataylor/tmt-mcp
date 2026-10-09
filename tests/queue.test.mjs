@@ -8,7 +8,7 @@ import { PROJECT, expireLease, fixture } from './helpers.mjs';
 
 let db;
 
-function add(deliveryId, { issueNumber = 42, issueId = 2938471055, action = 'agent:assigned', maxAttempts = 3 } = {}) {
+function add(deliveryId, { issueNumber = 42, issueId = 2938471055, action = 'agent:sdd', maxAttempts = 3 } = {}) {
   const payload = fixture('issues.labeled.json');
   payload.issue.number = issueNumber;
   payload.issue.id = issueId;
@@ -87,8 +87,8 @@ describe('claim', () => {
       deliveryId: 'd2',
       project: otherProject,
       payload: other,
-      context: buildContext({ event: 'issues', action: 'agent:assigned', payload: other, project: otherProject }),
-      action: 'agent:assigned',
+      context: buildContext({ event: 'issues', action: 'agent:sdd', payload: other, project: otherProject }),
+      action: 'agent:sdd',
     });
 
     assert.equal(queue.claim(db, { projectSlugs: ['side-project'] }).project_slug, 'side-project');
@@ -111,6 +111,53 @@ describe('complete, fail and heartbeat', () => {
     assert.equal(queue.complete(db, task.id).status, 'completed');
     assert.equal(queue.complete(db, task.id), null, 'completing twice is a no-op');
     assert.equal(queue.complete(db, 'missing-id'), null);
+  });
+
+  test('token_usage is overwritten on each complete or fail attempt', () => {
+    add('d1', { maxAttempts: 3 });
+    const firstUsage = {
+      inputTokens: 10,
+      outputTokens: 20,
+      cacheReadTokens: 30,
+      cacheWriteTokens: 40,
+    };
+    const secondUsage = {
+      inputTokens: 1,
+      outputTokens: 2,
+      cacheReadTokens: 3,
+      cacheWriteTokens: 4,
+    };
+
+    const claimed = queue.claim(db, {});
+    const failed = queue.fail(db, claimed.id, 'attempt 1', {
+      backoffSeconds: 1,
+      tokenUsage: firstUsage,
+    });
+    assert.deepEqual(failed.token_usage, firstUsage);
+    assert.deepEqual(queue.getTask(db, claimed.id).token_usage, firstUsage);
+
+    db.prepare("UPDATE agent_tasks SET available_at = datetime('now','-1 hours')").run();
+    const claimedAgain = queue.claim(db, {});
+    const completed = queue.complete(db, claimedAgain.id, { tokenUsage: secondUsage });
+    assert.deepEqual(completed.token_usage, secondUsage);
+    assert.deepEqual(queue.getTask(db, claimedAgain.id).token_usage, secondUsage);
+    assert.deepEqual(queue.listTasks(db)[0].token_usage, secondUsage);
+  });
+
+  test('a missing or invalid token_usage clears the previous value', () => {
+    add('d1');
+    const usage = {
+      inputTokens: 5,
+      outputTokens: 6,
+      cacheReadTokens: 7,
+      cacheWriteTokens: 8,
+    };
+    const task = queue.claim(db, {});
+    queue.fail(db, task.id, 'boom', { backoffSeconds: 1, tokenUsage: usage });
+    db.prepare("UPDATE agent_tasks SET available_at = datetime('now','-1 hours')").run();
+    const again = queue.claim(db, {});
+    const cleared = queue.complete(db, again.id, { tokenUsage: null });
+    assert.equal(cleared.token_usage, null);
   });
 
   test('fail re-queues with doubling backoff, then gives up at max_attempts', () => {

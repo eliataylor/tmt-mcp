@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createCoalescer, notifyAdmin } from '../src/notify.mjs';
@@ -23,7 +23,28 @@ import { createGithubClient } from './github.mjs';
 import { createNeonClient } from './neon.mjs';
 import { paneRunLogArgv, resolveHerdrSurface, workspaceLabelFor } from './herdr.mjs';
 import { buildPrompt } from './prompt.mjs';
-import { extractPlanSummary, isPlanAction, planBranchLink, renderPlanComment } from './plan.mjs';
+import {
+  ARTIFACT_KINDS,
+  artifactBranchLink,
+  artifactKindForAction,
+  cardMarker,
+  extractNeedsFromYou,
+  extractSummary,
+  isArtifactAction,
+  isExecuteAction,
+  isMentionHelpAction,
+  isTestAction,
+  isTriageAction,
+  listGraphicAllowedPaths,
+  listStageFolderInventory,
+  listWireframePaths,
+  MENTION_HELP_MARKER,
+  renderArtifactCard,
+  renderMentionHelpComment,
+  resolvePlanRelativePath,
+  resolveTestRelativePath,
+  resolveWireframesDir,
+} from './artifacts.mjs';
 import { resolvePosthogRunnerEnv } from './posthog.mjs';
 import { awaitPreviews, renderPreviewComment } from './preview.mjs';
 import {
@@ -35,20 +56,20 @@ import {
   npmCacheVolumeFor,
 } from './runner.mjs';
 import {
-  assertPlanPathTracked,
-  commitPlanRevision,
+  assertArtifactPathTracked,
+  artifactFileExists,
+  commitArtifactRevision,
   createStartCommit,
   ensureWorkdir,
-  planFileExists,
   prepareClone,
   readHeadSha,
   readPushedSha,
-  renderPlanScaffold,
-  resolvePlanRelativePath,
+  renderArtifactScaffold,
+  resolveActionArtifactPath,
   restoreGitMetadata,
   setCommitIdentity,
   snapshotGitMetadata,
-  writePlanScaffold,
+  writeArtifactScaffold,
 } from './repo.mjs';
 import {
   createTaskDir,
@@ -176,7 +197,8 @@ async function handleTask(ctx, task) {
   if (!project) {
     await queue.fail(
       task.id,
-      `Project "${slug}" is in the queue registry but has no orchestrator config entry.`
+      `Project "${slug}" is in the queue registry but has no orchestrator config entry.`,
+      { tokenUsage: null }
     );
     return;
   }
@@ -184,12 +206,34 @@ async function handleTask(ctx, task) {
   const prior = store.get(slug, issueNumber) || {};
   const containerName = containerNameFor({ slug, issueNumber, taskId: task.id });
 
+  // Mention with no Action token and no control labels: sticky help only, no clone/runner.
+  if (isMentionHelpAction(task.action)) {
+    const [owner, repoName] = project.repo.split('/');
+    const gh = createGithubClient({ token: config.secrets.GITHUB_TOKEN, logger });
+    const body = renderMentionHelpComment({ project });
+    await gh.upsertIssueComment({
+      owner,
+      repo: repoName,
+      issueNumber,
+      marker: MENTION_HELP_MARKER,
+      body,
+    });
+    await queue.complete(task.id, { tokenUsage: null });
+    logger.log(`[Task] ${label} mention_help — posted usage sticky`);
+    return;
+  }
+
   // Triage only reads the tree and writes labels and one comment, so it skips everything that
   // exists to support code: no task branch, no start commit, no PR, no database branch, no
-  // .env.local. An issue that later gets planned or executed still gets all of that then.
-  const triage = task.action === ACTIONS.TRIAGE;
-  const planning = isPlanAction(task.action);
+  // .env.local. An issue that later gets a stage file or execute still gets all of that then.
+  const triage = isTriageAction(task.action);
+  const stageArtifact = isArtifactAction(task.action);
+  const testing = isTestAction(task.action);
+  const executing = isExecuteAction(task.action);
+  const artifactKind = artifactKindForAction(task.action);
   const planPath = triage ? null : resolvePlanRelativePath(project, issueNumber);
+  const testPath = triage ? null : resolveTestRelativePath(project, issueNumber);
+  const artifactPath = triage ? null : resolveActionArtifactPath(project, issueNumber, task.action);
 
   const paths = createTaskDir({
     tasksDir: config.paths.tasks,
@@ -205,6 +249,7 @@ async function handleTask(ctx, task) {
   let clonePath = null;
   let gitMetaDir = null;
   let succeeded = false;
+  let result = null;
   let releaseGrant = async () => {};
   const canary = `tmt-canary-${randomBytes(16).toString('hex')}`;
   let needles = leakNeedles({ secrets: config.secrets, canary });
@@ -234,8 +279,20 @@ async function handleTask(ctx, task) {
     let pr = null;
     let headBefore = null;
     let planExists = false;
+    let testExists = false;
+    let artifactExists = false;
 
     if (!triage) {
+      if (testing && !clone.resume) {
+        const body =
+          `Cannot run \`${project.test_label || 'agent:test'}\` yet — there is no task branch/PR for #${issueNumber}. ` +
+          `Run \`${project.execute_label || 'agent:execute'}\` (or a stage label) first so Instructions exist.`;
+        await refuseIfLeak(body, needles, { label, issueNumber });
+        await gh.commentOnIssue({ owner, repo: repoName, issueNumber, body });
+        await queue.fail(task.id, 'test mode requires an existing task branch', { tokenUsage: null });
+        return;
+      }
+
       // The fallback address is deliberately undeliverable, but Vercel rejects a deployment whose
       // commit author it cannot resolve to an account. Any project with preview deploys must set
       // GIT_AUTHOR_EMAIL to a real address verified on the agent's GitHub account.
@@ -245,7 +302,9 @@ async function handleTask(ctx, task) {
         email: process.env.GIT_AUTHOR_EMAIL || 'agent@tmt.local',
       });
 
-      const scaffold = renderPlanScaffold({
+      const startKind = artifactKind || ARTIFACT_KINDS.PLAN;
+      const startPath = artifactPath || planPath;
+      const scaffold = renderArtifactScaffold(startKind, {
         issue: issueNumber,
         issue_title: context.issue.title,
         issue_url: context.issue.url,
@@ -253,27 +312,57 @@ async function handleTask(ctx, task) {
         created_at: new Date().toISOString(),
       });
 
-      // The branch's first commit adds the plan scaffold, whichever mode started the work. It is
-      // also what makes a draft PR legal: GitHub rejects a PR with no commits between base and head.
+      // The branch's first commit adds a stage scaffold. It is also what makes a draft PR legal.
       if (!clone.resume) {
         await createStartCommit({
           clonePath,
           issueNumber,
           branch: clone.branch,
-          planPath,
+          planPath: startPath,
+          artifactPath: startPath,
           scaffold,
           githubToken: config.secrets.GITHUB_TOKEN,
           logger,
         });
-      } else if (planning && !planFileExists({ clonePath, planPath })) {
-        // A branch from before plan files existed. The scaffold lands with this run's revision.
-        writePlanScaffold({ clonePath, planPath, content: scaffold });
-        await assertPlanPathTracked(clonePath, planPath);
+      } else if (stageArtifact && artifactPath && !artifactFileExists({ clonePath, artifactPath })) {
+        writeArtifactScaffold({ clonePath, artifactPath, content: scaffold });
+        await assertArtifactPathTracked(clonePath, artifactPath);
+      } else if (executing && testPath && !artifactFileExists({ clonePath, artifactPath: testPath })) {
+        const testScaffold = renderArtifactScaffold(ARTIFACT_KINDS.TEST, {
+          issue: issueNumber,
+          issue_title: context.issue.title,
+          issue_url: context.issue.url,
+          task_id: task.id,
+          created_at: new Date().toISOString(),
+        });
+        writeArtifactScaffold({ clonePath, artifactPath: testPath, content: testScaffold });
+        await assertArtifactPathTracked(clonePath, testPath);
       }
-      planExists = planFileExists({ clonePath, planPath });
+
+      if (artifactKind === ARTIFACT_KINDS.UX) {
+        const wireDir = resolveWireframesDir(project, issueNumber);
+        mkdirSync(join(clonePath, wireDir), { recursive: true });
+        const keep = join(clonePath, wireDir, '.gitkeep');
+        try {
+          writeFileSync(keep, '', { flag: 'wx' });
+        } catch {
+          // already present
+        }
+      }
+
+      planExists = artifactFileExists({ clonePath, artifactPath: planPath });
+      testExists = artifactFileExists({ clonePath, artifactPath: testPath });
+      artifactExists = artifactPath
+        ? artifactFileExists({ clonePath, artifactPath })
+        : false;
       headBefore = await readHeadSha(clonePath);
 
-      const planLink = planBranchLink({ owner, repo: repoName, branch: clone.branch, planPath });
+      const primaryLink = artifactBranchLink({
+        owner,
+        repo: repoName,
+        branch: clone.branch,
+        path: planPath,
+      });
       const ensured = await gh.ensurePullRequest({
         owner,
         repo: repoName,
@@ -282,7 +371,8 @@ async function handleTask(ctx, task) {
         title: `${context.issue.title} (#${issueNumber})`,
         body:
           `Automated work for #${issueNumber}.\n\n` +
-          `Plan: [\`${planPath}\`](${planLink}) — every plan run is its own commit, linked from the issue.\n\n` +
+          `Stage artifacts live under [\`.agent/plans/${issueNumber}/\`](${primaryLink.replace(/PLAN\.md$/, '')}). ` +
+          `PLAN.md is the System Design source of truth for execute.\n\n` +
           `Branch \`${clone.branch}\`, driven by the local agent orchestrator.\n` +
           'Closing this PR also releases the ephemeral database branch.',
       });
@@ -293,7 +383,7 @@ async function handleTask(ctx, task) {
       if (ensured.created) {
         const body =
           `Picked this up locally. Working on \`${clone.branch}\`, tracking in #${prNumber}.\n\n` +
-          `The plan lives in [\`${planPath}\`](${planLink}). I will link each revision here.`;
+          `Stage files: [\`.agent/plans/${issueNumber}/\`](${primaryLink.replace(/PLAN\.md$/, '')}). Sticky cards on this issue mirror each file.`;
         await refuseIfLeak(body, needles, { label, issueNumber });
         await gh.commentOnIssue({
           owner,
@@ -324,6 +414,11 @@ async function handleTask(ctx, task) {
       });
     }
 
+    const allowlistedCommands = flattenTestCommands(project.test_commands);
+    const stageInventory = triage
+      ? null
+      : listStageFolderInventory({ clonePath, project, issueNumber });
+
     writePrompt(
       paths,
       buildPrompt({
@@ -336,7 +431,13 @@ async function handleTask(ctx, task) {
         neon: neonInfo,
         planPath,
         planExists,
+        artifactPath,
+        artifactExists,
+        testPath,
+        testExists,
+        allowlistedCommands,
         canary,
+        stageInventory,
       })
     );
 
@@ -443,7 +544,7 @@ async function handleTask(ctx, task) {
     const exitCode = await waitForContainer(ctx, containerName, label);
     // Before any host git: the container can rewrite .git/config and hooks, and those run as us.
     restoreGitMetadata(clonePath, gitMetaDir);
-    const result = readResult(paths);
+    result = readResult(paths);
 
     succeeded = result.valid ? result.exitCode === 0 : exitCode === 0;
 
@@ -456,32 +557,62 @@ async function handleTask(ctx, task) {
       last_exit_code: result.valid ? result.exitCode : exitCode,
     });
 
-    let planFailure = null;
-    if (succeeded && planning) {
+    let publishFailure = null;
+    if (succeeded && (stageArtifact || testing)) {
       try {
-        await publishPlanRevision({
+        await publishArtifactRevision({
           gh,
           owner,
           repo: repoName,
           issueNumber,
           clonePath,
-          planPath,
+          artifactPath: artifactPath || testPath,
+          kind: artifactKind || ARTIFACT_KINDS.TEST,
           branch: clone.branch,
           headBefore,
           taskId: task.id,
           githubToken: config.secrets.GITHUB_TOKEN,
           label,
           needles,
+          prNumber,
+          prUrl: pr?.html_url || null,
+          project,
         });
       } catch (err) {
-        planFailure = `plan revision could not be published: ${err.message}`;
-        logger.error(`[Task] ${label} ${planFailure}`);
+        publishFailure = `artifact revision could not be published: ${err.message}`;
+        logger.error(`[Task] ${label} ${publishFailure}`);
         succeeded = false;
+      }
+    } else if (succeeded && executing && testPath) {
+      try {
+        await publishArtifactRevision({
+          gh,
+          owner,
+          repo: repoName,
+          issueNumber,
+          clonePath,
+          artifactPath: testPath,
+          kind: ARTIFACT_KINDS.TEST,
+          branch: clone.branch,
+          headBefore: null,
+          taskId: task.id,
+          githubToken: config.secrets.GITHUB_TOKEN,
+          label,
+          needles,
+          prNumber,
+          prUrl: pr?.html_url || null,
+          // Agent owns product commits; only stage TEST.md and leave the rest of the tree alone.
+          revertOthers: false,
+        });
+      } catch (err) {
+        logger.warn(`[Task] ${label} could not publish TEST.md card: ${err.message}`);
       }
     }
 
-    if (planFailure) {
-      await queue.fail(task.id, sanitizeText(planFailure, 2000));
+    if (publishFailure) {
+      await queue.fail(task.id, sanitizeText(publishFailure, 2000), {
+        tokenUsage: result?.tokenUsage ?? null,
+      });
     } else if (succeeded) {
       // Before completing, so the lease and its heartbeat still cover the wait on the build.
       await commentPreviewUrl(ctx, {
@@ -495,16 +626,20 @@ async function handleTask(ctx, task) {
         label,
         needles,
       });
-      await queue.complete(task.id);
+      await queue.complete(task.id, { tokenUsage: result?.tokenUsage ?? null });
       logger.log(`[Task] ${label} completed`);
     } else {
-      await queue.fail(task.id, describeFailure({ result, exitCode, paths }));
+      await queue.fail(task.id, describeFailure({ result, exitCode, paths }), {
+        tokenUsage: result?.tokenUsage ?? null,
+      });
       logger.warn(`[Task] ${label} failed`);
     }
   } catch (err) {
     // Any stage throwing lands here, including the .env.local guard and the secrets assertion.
     logger.error(`[Task] ${label} error: ${err.message}`);
-    await queue.fail(task.id, sanitizeText(`orchestrator error: ${err.message}`, 2000));
+    await queue.fail(task.id, sanitizeText(`orchestrator error: ${err.message}`, 2000), {
+      tokenUsage: result?.tokenUsage ?? null,
+    });
 
     // A Neon branch created during a run that never reached a PR has nothing to clean it up later,
     // so it gets removed here rather than left orphaned.
@@ -535,60 +670,131 @@ async function handleTask(ctx, task) {
   }
 }
 
+function flattenTestCommands(testCommands) {
+  if (!testCommands || typeof testCommands !== 'object') return [];
+  const out = [];
+  for (const key of ['unit', 'e2e', 'both']) {
+    const list = testCommands[key];
+    if (Array.isArray(list)) out.push(...list.filter((c) => typeof c === 'string' && c.trim()));
+  }
+  return [...new Set(out)];
+}
+
 /**
- * Commit the agent's plan edit as its own revision and link it from the issue.
- *
- * The orchestrator does this rather than the agent so that every plan run is guaranteed to leave
- * exactly one commit touching only the plan file, and a comment that points at that exact version.
+ * Commit the agent's stage-file edit and upsert the sticky issue card (collapsed full body).
  */
-async function publishPlanRevision({
+async function publishArtifactRevision({
   gh,
   owner,
   repo,
   issueNumber,
   clonePath,
-  planPath,
+  artifactPath,
+  kind,
   branch,
   headBefore,
   taskId,
   label,
   needles,
   githubToken = null,
+  prNumber = null,
+  prUrl = null,
+  revertOthers = true,
+  project = null,
 }) {
-  let planText = null;
+  let fileText = null;
   try {
-    planText = readFileSync(join(clonePath, planPath), 'utf8');
+    fileText = readFileSync(join(clonePath, artifactPath), 'utf8');
   } catch {
-    planText = null;
+    fileText = null;
   }
-  if (planText !== null) await refuseIfLeak(planText, needles, { label, issueNumber });
+  if (fileText !== null) await refuseIfLeak(fileText, needles, { label, issueNumber });
 
-  const revision = await commitPlanRevision({
+  const graphic =
+    kind === ARTIFACT_KINDS.UX && project
+      ? listGraphicAllowedPaths({ clonePath, project, issueNumber })
+      : null;
+
+  if (graphic?.length) {
+    for (const path of graphic) {
+      if (path === artifactPath) continue;
+      let companion = null;
+      try {
+        companion = readFileSync(join(clonePath, path), 'utf8');
+      } catch {
+        companion = null;
+      }
+      if (companion !== null) await refuseIfLeak(companion, needles, { label, issueNumber });
+    }
+  }
+
+  const revision = await commitArtifactRevision({
     clonePath,
-    planPath,
+    artifactPath,
     issueNumber,
     taskId,
     branch,
     headBefore,
     githubToken,
     logger,
+    kind,
+    revertOthers,
+    allowedPaths: graphic,
   });
 
   let summary = null;
+  let needs = null;
+  let bodyMarkdown = fileText;
   try {
-    summary = extractPlanSummary(readFileSync(join(clonePath, planPath), 'utf8'));
+    const latest = readFileSync(join(clonePath, artifactPath), 'utf8');
+    summary = extractSummary(latest);
+    needs = extractNeedsFromYou(latest);
+    bodyMarkdown = latest;
   } catch {
-    // A missing plan file just means there is no summary line to quote.
+    // Missing file — card may still link a prior sha.
   }
 
-  const body = renderPlanComment({ owner, repo, planPath, summary, ...revision });
+  let testStatus = null;
+  if (kind === ARTIFACT_KINDS.TEST && bodyMarkdown) {
+    if (/\bPASS\b|\bpassed\b/i.test(bodyMarkdown.split('## Results')[1] || '')) {
+      testStatus = 'pass';
+    } else if (/\bFAIL\b|\bfailed\b/i.test(bodyMarkdown.split('## Results')[1] || '')) {
+      testStatus = 'fail';
+    }
+  }
+
+  const wireframePaths =
+    kind === ARTIFACT_KINDS.UX && project
+      ? listWireframePaths({ clonePath, project, issueNumber })
+      : [];
+
+  const body = renderArtifactCard({
+    kind,
+    owner,
+    repo,
+    artifactPath,
+    summary,
+    needs,
+    bodyMarkdown,
+    prNumber,
+    prUrl,
+    testStatus,
+    wireframePaths,
+    ...revision,
+  });
   if (!body) {
-    throw new Error(`${planPath} has never been committed and the agent did not write it`);
+    throw new Error(`${artifactPath} has never been committed and the agent did not write it`);
   }
   await refuseIfLeak(body, needles, { label, issueNumber });
-  await gh.commentOnIssue({ owner, repo, issueNumber, body });
+  await gh.upsertIssueComment({
+    owner,
+    repo,
+    issueNumber,
+    marker: cardMarker(kind),
+    body,
+  });
   logger.log(
-    `[Task] ${label} ${revision.changed ? `linked plan revision ${revision.revision}` : 'plan unchanged; commented'}`
+    `[Task] ${label} ${revision.changed ? `linked ${kind} revision ${revision.revision}` : `${kind} unchanged; card upserted`}`
   );
 }
 

@@ -91,17 +91,23 @@ export function createQueueClient({ host, port, socketPath, timeoutMs = 15000, t
     },
 
     /** 409 is expected when the reaper or a cancel already moved the row out of processing. */
-    async complete(id) {
-      const res = await expectOk('POST', `/api/agent/tasks/${id}/complete`, undefined, {
-        allowStatuses: [409],
-      });
+    async complete(id, { tokenUsage = null } = {}) {
+      const res = await expectOk(
+        'POST',
+        `/api/agent/tasks/${id}/complete`,
+        { token_usage: tokenUsage },
+        { allowStatuses: [409] }
+      );
       return { applied: res.status === 200, status: res.status };
     },
 
-    async fail(id, error) {
-      const res = await expectOk('POST', `/api/agent/tasks/${id}/fail`, { error }, {
-        allowStatuses: [409],
-      });
+    async fail(id, error, { tokenUsage = null } = {}) {
+      const res = await expectOk(
+        'POST',
+        `/api/agent/tasks/${id}/fail`,
+        { error, token_usage: tokenUsage },
+        { allowStatuses: [409] }
+      );
       return { applied: res.status === 200, status: res.status };
     },
 

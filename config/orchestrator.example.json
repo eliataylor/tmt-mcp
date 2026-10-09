@@ -7,7 +7,11 @@
       "setup_cmd": null,
       "timeout_ms": null
     },
-    "env_template": {}
+    "env_template": {},
+    "test_commands": {
+      "unit": ["npm test"],
+      "e2e": []
+    }
   },
 
   "projects": {

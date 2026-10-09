@@ -82,7 +82,7 @@ describe('shared instance', () => {
     assert.equal(res.status, 201);
     const body = await res.json();
     assert.equal(body.project_slug, 'main-app');
-    assert.equal(body.action, 'agent:assigned');
+    assert.equal(body.action, 'agent:sdd');
     assert.equal(body.duplicate, false);
   });
 
@@ -177,17 +177,49 @@ describe('shared instance', () => {
     });
     assert.equal((await beat.json()).ok, true);
 
+    const usage = {
+      inputTokens: 11,
+      outputTokens: 22,
+      cacheReadTokens: 33,
+      cacheWriteTokens: 44,
+    };
     const done = await fetch(`${srv.base}/api/agent/tasks/${task.id}/complete`, {
       method: 'POST',
       headers: srv.auth,
+      body: JSON.stringify({ token_usage: usage }),
     });
-    assert.equal((await done.json()).task.status, 'completed');
+    const completed = await done.json();
+    assert.equal(completed.task.status, 'completed');
+    assert.deepEqual(completed.task.token_usage, usage);
 
     const again = await fetch(`${srv.base}/api/agent/tasks/${task.id}/complete`, {
       method: 'POST',
       headers: srv.auth,
     });
     assert.equal(again.status, 409);
+  });
+
+  test('fail overwrites token_usage from the request body', async () => {
+    await srv.deliver('issues.labeled.json', { delivery: 'usage-fail-1' });
+    const polled = await fetch(`${srv.base}/api/agent/poll`, {
+      method: 'POST',
+      headers: srv.auth,
+    });
+    const { task } = await polled.json();
+    const usage = {
+      inputTokens: 1,
+      outputTokens: 2,
+      cacheReadTokens: 3,
+      cacheWriteTokens: 4,
+    };
+    const failed = await fetch(`${srv.base}/api/agent/tasks/${task.id}/fail`, {
+      method: 'POST',
+      headers: srv.auth,
+      body: JSON.stringify({ error: 'boom', token_usage: usage }),
+    });
+    const body = await failed.json();
+    assert.equal(body.ok, true);
+    assert.deepEqual(body.task.token_usage, usage);
   });
 
   test('every orchestrator endpoint requires the bearer token', async () => {

@@ -29,19 +29,74 @@ WORKSPACE="${P}/workspace"
 CA_FILE="${P}/etc/ssl/tmt/ca.crt"
 
 CHAT_ID="${CHAT_ID:-}"
+# Small JSON object from the last cursor-agent --output-format json result, or empty.
+TOKEN_USAGE_JSON=""
+
+# Keep only non-negative integer token fields the orchestrator will persist.
+normalize_token_usage() {
+  local raw="$1"
+  [ -n "${raw}" ] || return 1
+  printf '%s' "${raw}" | jq -c '
+    def nonneg_int:
+      type == "number" and . == floor and . >= 0;
+    select(type == "object")
+    | {
+        inputTokens: .inputTokens,
+        outputTokens: .outputTokens,
+        cacheReadTokens: .cacheReadTokens,
+        cacheWriteTokens: .cacheWriteTokens
+      }
+    | select(
+        (.inputTokens | nonneg_int) and
+        (.outputTokens | nonneg_int) and
+        (.cacheReadTokens | nonneg_int) and
+        (.cacheWriteTokens | nonneg_int)
+      )
+  ' 2>/dev/null
+}
+
+# Prefer the last well-formed JSON object on stdout (json format emits one final result object).
+# stderr is merged into the capture, so skip non-JSON lines and take the last usage object.
+extract_token_usage_from_output() {
+  local out="$1"
+  local usage=""
+  usage="$(printf '%s\n' "${out}" | jq -Rn '
+    [inputs | select(length > 0) | fromjson? | select(type == "object" and (.usage | type == "object")) | .usage]
+    | last // empty
+  ' 2>/dev/null)" || usage=""
+  if [ -z "${usage}" ] || [ "${usage}" = "null" ]; then
+    return 1
+  fi
+  normalize_token_usage "${usage}"
+}
 
 write_result() {
   local code="$1" reason="${2:-}"
+  local usage_arg="${TOKEN_USAGE_JSON:-}"
   # jq keeps the reason and chat id correctly escaped; they are the only free-form values here.
-  jq -n --argjson exit_code "${code}" \
-        --arg reason "${reason}" \
-        --arg chat_id "${CHAT_ID}" \
-        --arg finished_at "$(date -u +%FT%TZ)" \
-        '{exit_code: $exit_code, finished_at: $finished_at}
-         + (if $reason == "" then {} else {reason: $reason} end)
-         + (if $chat_id == "" then {} else {chat_id: $chat_id} end)' \
-    > "${RESULT_FILE}" 2>/dev/null \
-    || printf '{"exit_code":%s,"finished_at":"%s"}\n' "${code}" "$(date -u +%FT%TZ)" > "${RESULT_FILE}"
+  # token_usage is a small JSON object (or omitted) — never the full assistant result text.
+  if [ -n "${usage_arg}" ]; then
+    jq -n --argjson exit_code "${code}" \
+          --arg reason "${reason}" \
+          --arg chat_id "${CHAT_ID}" \
+          --arg finished_at "$(date -u +%FT%TZ)" \
+          --argjson token_usage "${usage_arg}" \
+          '{exit_code: $exit_code, finished_at: $finished_at, token_usage: $token_usage}
+           + (if $reason == "" then {} else {reason: $reason} end)
+           + (if $chat_id == "" then {} else {chat_id: $chat_id} end)' \
+      > "${RESULT_FILE}" 2>/dev/null \
+      || printf '{"exit_code":%s,"finished_at":"%s"}\n' "${code}" "$(date -u +%FT%TZ)" > "${RESULT_FILE}"
+  else
+    jq -n --argjson exit_code "${code}" \
+          --arg reason "${reason}" \
+          --arg chat_id "${CHAT_ID}" \
+          --arg finished_at "$(date -u +%FT%TZ)" \
+          '{exit_code: $exit_code, finished_at: $finished_at}
+           + (if $reason == "" then {} else {reason: $reason} end)
+           + (if $chat_id == "" then {} else {chat_id: $chat_id} end)' \
+      > "${RESULT_FILE}" 2>/dev/null \
+      || printf '{"exit_code":%s,"finished_at":"%s"}\n' "${code}" "$(date -u +%FT%TZ)" > "${RESULT_FILE}"
+  fi
 }
 
 on_signal() {
@@ -203,7 +258,7 @@ else
   echo "[entrypoint] resuming chat ${CHAT_ID}" | tee -a "${LOG_FILE}"
 fi
 
-args=(--print --output-format text --force --trust --approve-mcps)
+args=(--print --output-format json --force --trust --approve-mcps)
 [ -n "${AGENT_MODEL:-}" ] && args+=(--model "${AGENT_MODEL}")
 [ -n "${CHAT_ID}" ] && args+=(--resume "${CHAT_ID}")
 
@@ -217,13 +272,24 @@ if [ -n "${AGENT_TIMEOUT_SECONDS:-}" ]; then
   agent=(timeout --signal=TERM --kill-after=30 "${AGENT_TIMEOUT_SECONDS}" cursor-agent)
 fi
 
-# PIPESTATUS is why this is bash and not sh: tee must not mask the agent's exit code.
-"${agent[@]}" "${args[@]}" "$(cat "${PROMPT_FILE}")" 2>&1 | tee -a "${LOG_FILE}"
-code=${PIPESTATUS[0]}
+# Capture stdout/stderr for usage parsing while still appending to run.log. PIPESTATUS is why
+# this is bash and not sh: tee must not mask the agent's exit code.
+agent_out_file="$(mktemp)"
+"${agent[@]}" "${args[@]}" "$(cat "${PROMPT_FILE}")" >"${agent_out_file}" 2>&1
+code=$?
+tee -a "${LOG_FILE}" < "${agent_out_file}" >/dev/null
+agent_out="$(cat "${agent_out_file}")"
+rm -f "${agent_out_file}"
 
 if [ "${code}" -eq 124 ] && [ -n "${AGENT_TIMEOUT_SECONDS:-}" ]; then
   echo "[entrypoint] cursor-agent timed out after ${AGENT_TIMEOUT_SECONDS}s" | tee -a "${LOG_FILE}"
 fi
 echo "[entrypoint] cursor-agent exited ${code}" | tee -a "${LOG_FILE}"
+
+TOKEN_USAGE_JSON="$(extract_token_usage_from_output "${agent_out}")" || TOKEN_USAGE_JSON=""
+if [ -n "${TOKEN_USAGE_JSON}" ]; then
+  echo "[entrypoint] token usage ${TOKEN_USAGE_JSON}" | tee -a "${LOG_FILE}"
+fi
+
 write_result "${code}"
 exit "${code}"

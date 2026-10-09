@@ -16,12 +16,12 @@
     "author_association": "OWNER",
     "labels": [
       { "id": 8812001, "name": "bug", "color": "d73a4a" },
-      { "id": 8812002, "name": "agent:assigned", "color": "0e8a16" }
+      { "id": 8812002, "name": "agent:sdd", "color": "0e8a16" }
     ],
     "assignees": [{ "login": "dev-agent", "id": 99120034, "type": "Bot" }],
     "body": "The scorer short-circuits when a candidate has no uploads and we end up writing a literal 0 instead of skipping the row.\n\nRelevant code:\n\n- https://github.com/my-org/primary-app/blob/main/src/services/MatchScoreService.ts#L118-L146\n- `src/lib/matchScore/messageBuilder.ts:88`\n- packages/api/src/scoring/normalize.mjs\n\nStack trace from production:\n\n```\nTypeError: Cannot read properties of undefined (reading 'tags')\n    at buildProfile (src/lib/matchScore/profile.ts:212:18)\n    at scoreCandidate (src/services/MatchScoreService.ts:131:22)\n```\n\nRelated to #7 and my-org/infra-tools#215. Regression landed in a1b2c3d4e5f67890.\n\n- [x] Reproduce with a fixture candidate\n- [ ] Skip instead of writing 0\n- [ ] Backfill the affected rows"
   },
-  "label": { "id": 8812002, "name": "agent:assigned", "color": "0e8a16" },
+  "label": { "id": 8812002, "name": "agent:sdd", "color": "0e8a16" },
   "repository": {
     "id": 771200345,
     "name": "primary-app",

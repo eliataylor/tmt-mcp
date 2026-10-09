@@ -11,10 +11,25 @@ import {
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { normalizePlanFolder } from '../src/projects.mjs';
 import { git, run } from './exec.mjs';
+import {
+  ARTIFACT_KINDS,
+  artifactKindForAction,
+  resolveArtifactRelativePath,
+  resolvePlanRelativePath,
+} from './artifacts.mjs';
 
-const PLAN_SCAFFOLD_PATH = fileURLToPath(new URL('../templates/plan.scaffold.md', import.meta.url));
+const TEMPLATES_DIR = fileURLToPath(new URL('../templates/', import.meta.url));
+
+const SCAFFOLD_FILES = {
+  [ARTIFACT_KINDS.PLAN]: 'plan.scaffold.md',
+  [ARTIFACT_KINDS.RESEARCH]: 'research.scaffold.md',
+  [ARTIFACT_KINDS.UX]: 'ux.scaffold.md',
+  [ARTIFACT_KINDS.TEST]: 'test.scaffold.md',
+  [ARTIFACT_KINDS.MONITOR]: 'monitor.scaffold.md',
+};
+
+export { resolvePlanRelativePath, resolveArtifactRelativePath };
 
 /**
  * Git isolation.
@@ -213,20 +228,17 @@ export async function prepareClone({
   return { clonePath, mirror, defaultBranch: effectiveDefault, ...plan };
 }
 
-/** Where an issue's plan lives, relative to the repository root. */
-export function resolvePlanRelativePath(project, issueNumber) {
-  const n = Number(issueNumber);
-  if (!Number.isInteger(n) || n <= 0) {
-    throw new Error(`issue number must be a positive integer, got "${issueNumber}"`);
-  }
-  return `${normalizePlanFolder(project?.plan_folder)}/PLAN-${n}.md`;
+function scaffoldTemplatePath(kind) {
+  const file = SCAFFOLD_FILES[kind];
+  if (!file) throw new Error(`no scaffold template for artifact kind "${kind}"`);
+  return join(TEMPLATES_DIR, file);
 }
 
 /**
  * Fill the scaffold's `{placeholder}` tokens in one pass, so a value that itself contains a token
  * (an issue title like "Support {issue} links") is written literally rather than substituted again.
  */
-export function renderPlanScaffold(values, template = readFileSync(PLAN_SCAFFOLD_PATH, 'utf8')) {
+export function renderScaffold(values, template) {
   return template.replace(/\{([a-z_]+)\}/g, (token, key) =>
     Object.hasOwn(values, key) && values[key] !== null && values[key] !== undefined
       ? String(values[key]).replace(/[\r\n]+/g, ' ')
@@ -234,9 +246,28 @@ export function renderPlanScaffold(values, template = readFileSync(PLAN_SCAFFOLD
   );
 }
 
+export function renderPlanScaffold(values, template = readFileSync(scaffoldTemplatePath(ARTIFACT_KINDS.PLAN), 'utf8')) {
+  return renderScaffold(values, template);
+}
+
+export function renderArtifactScaffold(kind, values) {
+  return renderScaffold(values, readFileSync(scaffoldTemplatePath(kind), 'utf8'));
+}
+
+/** Primary artifact path for a queue action. */
+export function resolveActionArtifactPath(project, issueNumber, action) {
+  const kind = artifactKindForAction(action);
+  if (!kind) return null;
+  return resolveArtifactRelativePath(project, issueNumber, kind);
+}
+
 /** Writes the scaffold unless the file already exists. Returns whether it wrote anything. */
 export function writePlanScaffold({ clonePath, planPath, content }) {
-  const target = join(clonePath, planPath);
+  return writeArtifactScaffold({ clonePath, artifactPath: planPath, content });
+}
+
+export function writeArtifactScaffold({ clonePath, artifactPath, content }) {
+  const target = join(clonePath, artifactPath);
   if (existsSync(target)) return false;
   mkdirSync(dirname(target), { recursive: true });
   writeFileSync(target, content);
@@ -244,14 +275,22 @@ export function writePlanScaffold({ clonePath, planPath, content }) {
 }
 
 export function planFileExists({ clonePath, planPath }) {
-  return existsSync(join(clonePath, planPath));
+  return artifactFileExists({ clonePath, artifactPath: planPath });
 }
 
-/** A gitignored plan folder would make every plan commit silently empty. */
+export function artifactFileExists({ clonePath, artifactPath }) {
+  return existsSync(join(clonePath, artifactPath));
+}
+
+/** A gitignored artifact folder would make every revision commit silently empty. */
 export async function assertPlanPathTracked(clonePath, planPath) {
-  if (await git(clonePath).succeeds(['check-ignore', '-q', '--', planPath])) {
+  return assertArtifactPathTracked(clonePath, planPath);
+}
+
+export async function assertArtifactPathTracked(clonePath, artifactPath) {
+  if (await git(clonePath).succeeds(['check-ignore', '-q', '--', artifactPath])) {
     throw new Error(
-      `${planPath} is covered by .gitignore in this repository, so plan revisions cannot be ` +
+      `${artifactPath} is covered by .gitignore in this repository, so stage revisions cannot be ` +
         'committed. Point plan_folder at a tracked folder or un-ignore it.'
     );
   }
@@ -269,36 +308,50 @@ export async function createStartCommit({
   branch,
   planPath,
   scaffold,
+  artifactPath = planPath,
   githubToken = null,
   logger = console,
 }) {
   const g = git(clonePath);
-  const wrote = writePlanScaffold({ clonePath, planPath, content: scaffold });
+  const path = artifactPath || planPath;
+  const wrote = writeArtifactScaffold({ clonePath, artifactPath: path, content: scaffold });
   if (wrote) {
-    await assertPlanPathTracked(clonePath, planPath);
-    await g.run(['add', '--', planPath]);
-    await g.run(['commit', '-m', `chore(#${issueNumber}): add plan scaffold`]);
+    await assertArtifactPathTracked(clonePath, path);
+    await g.run(['add', '--', path]);
+    const base = path.split('/').pop();
+    const scaffoldLabel = base === 'PLAN.md' ? 'plan scaffold' : `${base} scaffold`;
+    await g.run(['commit', '-m', `chore(#${issueNumber}): add ${scaffoldLabel}`]);
   } else {
     await g.run(['commit', '--allow-empty', '-m', `chore(#${issueNumber}): start agent work`]);
   }
   await pushBranch({ clonePath, branch, githubToken });
-  logger.log(`[Repo] pushed ${branch}${wrote ? ` with ${planPath}` : ''}`);
+  logger.log(`[Repo] pushed ${branch}${wrote ? ` with ${path}` : ''}`);
 }
 
 export async function readHeadSha(clonePath) {
   return git(clonePath).capture(['rev-parse', 'HEAD']);
 }
 
-/** The last commit that touched the plan file, or null when it has never been committed. */
+/** The last commit that touched the file, or null when it has never been committed. */
 export async function readPlanCommitSha({ clonePath, planPath }) {
-  const sha = await git(clonePath).capture(['log', '-1', '--format=%H', '--', planPath]);
+  return readArtifactCommitSha({ clonePath, artifactPath: planPath });
+}
+
+export async function readArtifactCommitSha({ clonePath, artifactPath }) {
+  const sha = await git(clonePath).capture(['log', '-1', '--format=%H', '--', artifactPath]);
   return sha || null;
 }
 
-const REVISION_SUBJECT = /^plan\(#\d+\): revision \d+/;
+const REVISION_SUBJECT = /^(?:plan|artifact)\(#\d+\): revision \d+/;
 
 export function planRevisionMessage({ issueNumber, revision, taskId }) {
-  return `plan(#${issueNumber}): revision ${revision} (task ${String(taskId).slice(0, 8)})`;
+  return artifactRevisionMessage({ issueNumber, revision, taskId, kind: 'plan' });
+}
+
+export function artifactRevisionMessage({ issueNumber, revision, taskId, kind = 'artifact' }) {
+  const label =
+    kind === 'PLAN' || kind === 'plan' || kind === ARTIFACT_KINDS.PLAN ? 'plan' : 'artifact';
+  return `${label}(#${issueNumber}): revision ${revision} (task ${String(taskId).slice(0, 8)})`;
 }
 
 /** Porcelain v1 paths, with a rename reported as its destination. */
@@ -322,8 +375,27 @@ export function parsePorcelainPaths(output) {
  * force-push, and they are reported so a human can look at them. Ignored files (`.env.local`,
  * `node_modules`) are never touched.
  */
-export async function commitPlanRevision({
+export async function commitPlanRevision(opts) {
+  return commitArtifactRevision({
+    ...opts,
+    artifactPath: opts.planPath,
+    kind: opts.kind || ARTIFACT_KINDS.PLAN,
+  });
+}
+
+/**
+ * Commit whatever the agent wrote to the artifact path(s), and nothing else.
+ *
+ * Uncommitted edits elsewhere are reverted. Agent commits already on the branch stay.
+ * Ignored files (`.env.local`, `node_modules`) are never touched.
+ *
+ * @param {object} opts
+ * @param {string[]|null} [opts.allowedPaths] when set, stage every existing path in the list and
+ *   revert everything outside it (e.g. graphic: UX.md + wireframes/*.drawio).
+ */
+export async function commitArtifactRevision({
   clonePath,
+  artifactPath,
   planPath,
   issueNumber,
   taskId,
@@ -331,7 +403,13 @@ export async function commitPlanRevision({
   headBefore,
   githubToken = null,
   logger = console,
+  allowedPaths = null,
+  kind = 'artifact',
+  /** When false (execute TEST publish), only stage the artifact; leave other dirty files alone. */
+  revertOthers = true,
 }) {
+  const path = artifactPath || planPath;
+  const stagePaths = allowedPaths?.length ? [...new Set(allowedPaths)] : [path];
   const g = git(clonePath);
   const warnings = [];
 
@@ -342,34 +420,54 @@ export async function commitPlanRevision({
     warnings.push(`the agent made ${agentCommits} commit(s) of its own; left in place`);
   }
 
-  // Not capture(): trimming would eat the leading status column of the first line.
   const { stdout: status } = await g.run(['status', '--porcelain=v1', '--untracked-files=all']);
-  const stray = parsePorcelainPaths(status).filter((p) => p !== planPath);
+  const allow = new Set(stagePaths);
+  const stray = parsePorcelainPaths(status).filter((p) => !allow.has(p));
 
-  await g.run(['reset', '-q']);
-  if (planFileExists({ clonePath, planPath })) await g.run(['add', '--', planPath]);
-  if (stray.length) {
-    await g.run(['checkout', '--', '.']);
-    await g.run(['clean', '-fdq']);
-    warnings.push(`reverted edits outside the plan: ${stray.slice(0, 10).join(', ')}`);
+  async function stageAllowed() {
+    for (const p of stagePaths) {
+      if (artifactFileExists({ clonePath, artifactPath: p })) await g.run(['add', '--', p]);
+    }
+  }
+
+  if (revertOthers) {
+    await g.run(['reset', '-q']);
+    await stageAllowed();
+    if (stray.length) {
+      await g.run(['checkout', '--', '.']);
+      await g.run(['clean', '-fdq']);
+      await stageAllowed();
+      const noun = path.endsWith('/PLAN.md') || path.endsWith('PLAN.md') ? 'plan' : 'artifact';
+      warnings.push(`reverted edits outside the ${noun}: ${stray.slice(0, 10).join(', ')}`);
+    }
+  } else {
+    // Stage only the primary artifact; do not reset the rest of the tree (execute may have product edits).
+    if (artifactFileExists({ clonePath, artifactPath: path })) {
+      await g.run(['add', '--', path]);
+    }
   }
   for (const w of warnings) logger.warn(`[Repo] #${issueNumber}: ${w}`);
 
-  const prevSha = await readPlanCommitSha({ clonePath, planPath });
+  const prevSha = await readArtifactCommitSha({ clonePath, artifactPath: path });
 
-  if (await g.succeeds(['diff', '--cached', '--quiet', '--', planPath])) {
-    return { changed: false, sha: prevSha, prevSha, revision: null, warnings };
+  if (await g.succeeds(['diff', '--cached', '--quiet', '--', ...stagePaths])) {
+    const sha = prevSha || (await readHeadSha(clonePath));
+    return { changed: false, sha, prevSha, revision: null, warnings };
   }
 
   const subjects = prevSha
-    ? (await g.capture(['log', '--format=%s', '--', planPath])).split('\n')
+    ? (await g.capture(['log', '--format=%s', '--', path])).split('\n')
     : [];
   const revision = subjects.filter((s) => REVISION_SUBJECT.test(s)).length + 1;
 
-  await g.run(['commit', '-m', planRevisionMessage({ issueNumber, revision, taskId })]);
+  await g.run([
+    'commit',
+    '-m',
+    artifactRevisionMessage({ issueNumber, revision, taskId, kind }),
+  ]);
   await pushBranch({ clonePath, branch, githubToken });
   const sha = await readHeadSha(clonePath);
-  logger.log(`[Repo] #${issueNumber}: pushed plan revision ${revision} (${sha.slice(0, 7)})`);
+  logger.log(`[Repo] #${issueNumber}: pushed ${path} revision ${revision} (${sha.slice(0, 7)})`);
 
   return { changed: true, sha, prevSha, revision, warnings };
 }

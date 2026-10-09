@@ -46,8 +46,22 @@ export function openDatabase(dbPath = DEFAULT_DB_PATH) {
 
   assertSqliteVersion(db);
   db.exec(readFileSync(SCHEMA_SQL, 'utf8'));
+  ensureAgentTaskColumns(db);
 
   return db;
+}
+
+/**
+ * CREATE TABLE IF NOT EXISTS never adds columns to an existing table. Apply additive changes
+ * here so a restarted queue picks them up without a separate migration tool.
+ */
+function ensureAgentTaskColumns(db) {
+  const cols = new Set(
+    db.prepare(`PRAGMA table_info(agent_tasks)`).all().map((row) => row.name)
+  );
+  if (!cols.has('token_usage')) {
+    db.exec(`ALTER TABLE agent_tasks ADD COLUMN token_usage TEXT`);
+  }
 }
 
 export function databaseInfo(db) {

@@ -4,9 +4,13 @@
       "slug": "main-app",
       "repo": "my-org/primary-app",
       "default_branch": "main",
-      "trigger_label": "agent:assigned",
+      "trigger_label": "agent:sdd",
       "execute_label": "agent:execute",
       "triage_label": "agent:triage",
+      "research_label": "agent:research",
+      "graphic_label": "agent:graphic",
+      "monitor_label": "agent:monitor",
+      "test_label": "agent:test",
       "mention": "@dev-agent",
       "plan_folder": ".agent/plans",
       "agent_login": "dev-agent",
@@ -16,7 +20,7 @@
       "slug": "side-project",
       "repo": "personal/side-project",
       "default_branch": "main",
-      "trigger_label": "agent:assigned",
+      "trigger_label": "agent:sdd",
       "mention": "@dev-agent",
       "webhook_secret_env": "WEBHOOK_SECRET_SIDE_PROJECT"
     }

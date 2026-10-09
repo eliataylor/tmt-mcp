@@ -113,12 +113,18 @@ export function resolveGitUrls(registryEntry, orchestratorEntry = {}) {
 function mergeProject(registryEntry, orchestratorEntry = {}, defaults = {}) {
   const agent = { ...(defaults.agent || {}), ...(orchestratorEntry.agent || {}) };
   const { fetch_url, push_url } = resolveGitUrls(registryEntry, orchestratorEntry);
+  const testCommands = {
+    ...(defaults.test_commands || {}),
+    ...(orchestratorEntry.test_commands || {}),
+  };
+
   return {
     ...registryEntry,
     local_path: orchestratorEntry.local_path || null,
     neon: orchestratorEntry.neon || null,
     posthog: orchestratorEntry.posthog || null,
     env_template: { ...(defaults.env_template || {}), ...(orchestratorEntry.env_template || {}) },
+    test_commands: testCommands,
     agent: {
       model: agent.model || null,
       setup_cmd: agent.setup_cmd || null,

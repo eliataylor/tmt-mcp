@@ -156,7 +156,7 @@ because `docker inspect` and the container config both echo environment variable
 overwritten and unlinked when the task ends.
 
 `.env.local` is written only after `git check-ignore` confirms the repository ignores it.
-Plan mode reverts uncommitted edits outside the plan file and commits that file from the host.
+Stage-file modes (research, UX, SDD, monitor, test) revert uncommitted edits outside their one artifact file and commit that file from the host.
 Triage never creates `agent/issue-<n>`; its `remote.origin.pushurl` is
 `read-only://triage-tasks-do-not-push`, a scheme git will not transport.
 

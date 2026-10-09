@@ -171,15 +171,21 @@ function mountControlRoutes(app, { db, registry, config, log }) {
   });
 
   app.post('/api/agent/tasks/:id/complete', guard, (req, res) => {
-    const task = queue.complete(db, req.params.id);
+    const tokenUsage = (req.body || {}).token_usage ?? null;
+    const task = queue.complete(db, req.params.id, { tokenUsage });
     if (!task) return res.status(409).json(notProcessing(db, req.params.id));
     log.info(`Completed ${task.id}`);
     return res.json({ ok: true, task });
   });
 
   app.post('/api/agent/tasks/:id/fail', guard, (req, res) => {
-    const error = (req.body || {}).error ?? null;
-    const task = queue.fail(db, req.params.id, error, { backoffSeconds: config.backoffSeconds });
+    const body = req.body || {};
+    const error = body.error ?? null;
+    const tokenUsage = body.token_usage ?? null;
+    const task = queue.fail(db, req.params.id, error, {
+      backoffSeconds: config.backoffSeconds,
+      tokenUsage,
+    });
     if (!task) return res.status(409).json(notProcessing(db, req.params.id));
     log.warn(
       `Failed ${task.id} (attempt ${task.attempts}/${task.max_attempts}) -> ${task.status}` +

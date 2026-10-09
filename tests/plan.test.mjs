@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import test, { describe } from 'node:test';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { normalizePlanFolder } from '../src/projects.mjs';
 import {
@@ -17,10 +17,16 @@ import {
 import {
   compareLink,
   extractPlanSummary,
+  isMentionHelpAction,
   isPlanAction,
+  isTmtCardComment,
+  MENTION_HELP_MARKER,
+  needsTaskBranch,
   planPermalink,
+  renderMentionHelpComment,
   renderPlanComment,
 } from '../orchestrator/plan.mjs';
+import { PROJECT } from './helpers.mjs';
 
 const quiet = { log() {}, warn() {} };
 
@@ -48,7 +54,7 @@ function makeClone() {
   return { clone, remote };
 }
 
-const PLAN = '.agent/plans/PLAN-42.md';
+const PLAN = '.agent/plans/42/PLAN.md';
 const SCAFFOLD = '# Plan\n\n<!-- summary: -->\n\n## Understanding\n';
 
 async function started() {
@@ -65,6 +71,7 @@ async function started() {
 }
 
 function revise(clone, text) {
+  mkdirSync(dirname(join(clone, PLAN)), { recursive: true });
   writeFileSync(join(clone, PLAN), text);
 }
 
@@ -81,8 +88,8 @@ const commit = (repo, taskId = 'task-aaaaaaaa-1') =>
 
 describe('plan paths', () => {
   test('defaults to .agent/plans and names the file after the issue', () => {
-    assert.equal(resolvePlanRelativePath({}, 42), '.agent/plans/PLAN-42.md');
-    assert.equal(resolvePlanRelativePath({ plan_folder: 'docs/plans/' }, 7), 'docs/plans/PLAN-7.md');
+    assert.equal(resolvePlanRelativePath({}, 42), '.agent/plans/42/PLAN.md');
+    assert.equal(resolvePlanRelativePath({ plan_folder: 'docs/plans/' }, 7), 'docs/plans/7/PLAN.md');
   });
 
   test('normalizes harmless spellings of a folder', () => {
@@ -123,7 +130,7 @@ describe('plan scaffold', () => {
       task_id: 'x',
       created_at: 'now',
     });
-    for (const heading of ['## Understanding', '## Open questions', '## Implementation plan']) {
+    for (const heading of ['## Understanding', '## Needs from you', '## Implementation plan']) {
       assert.match(out, new RegExp(heading));
     }
     assert.match(out, /<!-- summary: -->/);
@@ -238,7 +245,7 @@ describe('plan comment', () => {
   const prevSha = 'a'.repeat(40);
 
   test('plan actions are the three planning triggers', () => {
-    for (const action of ['agent:assigned', 'agent:opened', 'comment_created']) {
+    for (const action of ['agent:sdd', 'agent:opened', 'comment_created']) {
       assert.equal(isPlanAction(action), true, action);
     }
     for (const action of ['agent:execute', 'agent:triage']) {
@@ -248,21 +255,23 @@ describe('plan comment', () => {
 
   test('links the exact version and the diff from the previous revision', () => {
     const body = renderPlanComment({ ...base, changed: true, sha, prevSha, revision: 3, summary: 'Narrowed scope.' });
-    assert.match(body, /Plan revision 3/);
+    assert.match(body, /System design/);
+    assert.match(body, /Rev 3/);
+    assert.match(body, /<!-- tmt:card:PLAN -->/);
     assert.ok(body.includes(planPermalink({ ...base, sha })));
-    assert.ok(body.includes(`/blob/${sha}/.agent/plans/PLAN-42.md`));
+    assert.ok(body.includes(`/blob/${sha}/.agent/plans/42/PLAN.md`));
     assert.ok(body.includes(compareLink({ ...base, fromSha: prevSha, toSha: sha })));
     assert.match(body, /> Narrowed scope\./);
   });
 
   test('the first revision has no compare link', () => {
     const body = renderPlanComment({ ...base, changed: true, sha, prevSha: null, revision: 1 });
-    assert.doesNotMatch(body, /compare/);
+    assert.doesNotMatch(body, /compare\//);
   });
 
   test('an unchanged plan says so and links the current version', () => {
     const body = renderPlanComment({ ...base, changed: false, sha: prevSha, prevSha, revision: null });
-    assert.match(body, /Plan unchanged/);
+    assert.match(body, /Unchanged since last run/);
     assert.ok(body.includes(`/blob/${prevSha}/`));
   });
 
@@ -280,5 +289,21 @@ describe('plan comment', () => {
     assert.equal(extractPlanSummary('# x\n<!-- summary:  Two\n lines  -->'), 'Two lines');
     assert.equal(extractPlanSummary(`<!-- summary: ${'x'.repeat(400)} -->`).length, 280);
     assert.equal(extractPlanSummary('no slot'), null);
+  });
+});
+
+describe('mention help', () => {
+  test('mention_help skips the task branch and is recognized as a sticky card', () => {
+    assert.equal(isMentionHelpAction('mention_help'), true);
+    assert.equal(needsTaskBranch('mention_help'), false);
+    assert.equal(needsTaskBranch('agent:sdd'), true);
+  });
+
+  test('renders a sticky usage card with configured labels', () => {
+    const body = renderMentionHelpComment({ project: PROJECT });
+    assert.ok(body.startsWith(MENTION_HELP_MARKER));
+    assert.match(body, /@dev-agent agent:execute/);
+    assert.match(body, /`agent:sdd`/);
+    assert.equal(isTmtCardComment(body), true);
   });
 });

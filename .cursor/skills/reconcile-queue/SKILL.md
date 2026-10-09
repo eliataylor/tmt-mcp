@@ -32,7 +32,7 @@ npm run reconcile -- --comments
 
 | Column | Meaning |
 | --- | --- |
-| **Queue action** | What `classify()` in `src/triggers.mjs` would enqueue (`agent:execute`, `comment_created`, etc.) or `—` if ignored |
+| **Queue action** | What `classify()` in `src/triggers.mjs` would enqueue (`agent:sdd`, `agent:execute`, `agent:test`, `agent:research`, …) or `—` if ignored |
 | **Latest task** | Most recent queue row for that issue (any time), not only since the event |
 | **Next step** | Copy-paste `npm run reconcile -- --enqueue <#>` when a row missed the queue; `queued` / `task completed after event` → usually no action |
 
@@ -40,7 +40,7 @@ npm run reconcile -- --comments
 
 1. **`--enqueue <row#>`** — `POST /api/agent/ingest` on the control listener when the image includes that route; otherwise the script enqueues via the host-mounted `sqlite_data/*/agent_queue.db` (same `handleDelivery` path). Rebuild `webhook-server` if you want HTTP-only ingest.
 2. **GitHub redelivery** — use when the original delivery still appears in Recent Deliveries; dedupes on `X-GitHub-Delivery`.
-3. **Manual** — toggle a control label or add a comment with the project `mention` from `config/projects.json`.
+3. **Manual** — toggle a control label, or comment with the project `mention` plus a control-label token (e.g. `@tmt-agent agent:sdd …`). A bare mention with no token and no control label on the issue queues `mention_help` only.
 
 ## Limits
 

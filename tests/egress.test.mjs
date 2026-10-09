@@ -212,7 +212,7 @@ describe('github mcp mode', () => {
   test('triage is issues only, plan is read-only, execute cannot see workflow secrets', () => {
     assert.equal(githubMcpEnv('agent:triage').GITHUB_TOOLSETS, 'issues');
     assert.equal(githubMcpEnv('agent:triage').GITHUB_LOCKDOWN_MODE, '1');
-    assert.equal(githubMcpEnv('agent:assigned').GITHUB_READ_ONLY, '1');
+    assert.equal(githubMcpEnv('agent:sdd').GITHUB_READ_ONLY, '1');
     assert.match(githubMcpEnv('agent:execute').GITHUB_TOOLSETS, /repos/);
     assert.equal(githubMcpEnv('agent:execute').GITHUB_READ_ONLY, undefined);
     assert.doesNotMatch(githubMcpEnv('agent:execute').GITHUB_TOOLSETS, /actions/);
